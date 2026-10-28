@@ -29,7 +29,15 @@ jobs:
       - name: Format
         run: forge fmt --check
 
-      # via_ir compiles are memory heavy: two compiler jobs fit the runner, four do not
+      # via_ir compiles are memory heavy: the runner has no swap, and systemd-oomd stops the build
+      - name: Add swap
+        run: |
+          sudo systemctl stop systemd-oomd || true
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /swapfile2 && sudo chmod 600 /swapfile2
+          sudo mkswap /swapfile2 && sudo swapon /swapfile2
+          free -h
+
       - uses: actions/cache@v4
         with:
           path: |
