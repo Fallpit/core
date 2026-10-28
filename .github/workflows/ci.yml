@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
 
@@ -29,8 +29,17 @@ jobs:
       - name: Format
         run: forge fmt --check
 
+      # via_ir compiles are memory heavy: two compiler jobs fit the runner, four do not
+      - uses: actions/cache@v4
+        with:
+          path: |
+            out
+            cache
+          key: forge-${{ hashFiles('foundry.toml', 'foundry.lock', 'src/**', 'script/**', 'test/**') }}
+          restore-keys: forge-
+
       - name: Build and sizes
-        run: forge build --sizes
+        run: forge build --sizes --threads 2
 
       - name: Test
-        run: forge test
+        run: forge test --threads 2
