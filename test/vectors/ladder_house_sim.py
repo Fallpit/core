@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Reference model of the ladder: path-independent per-bucket depth (weighted-entropy cost function) + LP ranges.
 
 Cost function (dual of R(p) = sum_j b_j (p_j ln(p_j/pi_j) - p_j + pi_j)):

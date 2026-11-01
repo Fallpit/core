@@ -121,6 +121,11 @@ interface IFallpitHook {
     /// @notice The vol keeper set the sigma a round prices its remaining sd and vega with (`setSigmaEff`).
     /// @param sigmaEff the sigma in force from now on, WAD, after the clamps
     event SigmaEffSet(bytes32 indexed roundId, uint256 sigmaEff);
+    /// @notice A live strike opened (`openStrike`): products `indexLow` (`[0, m]`, close below the edge) and
+    ///         `indexHigh` (`[m + 1, 39]`, close above it), at the print (`price`, `ts`) that placed it.
+    event StrikeOpened(
+        bytes32 indexed roundId, uint8 m, uint8 indexLow, uint8 indexHigh, uint256 price, uint64 ts
+    );
 
     error OnlyRouter();
     error Reentrancy();
@@ -144,6 +149,12 @@ interface IFallpitHook {
     error AlreadySettled();
     error ChallengeWindowOpen();
     error VoidNotAllowed();
+    /// @notice The round's close and the close it started from have different stock token multipliers (a
+    ///         split or other corporate action in between): it cannot settle, `voidRound` voids it.
+    error CorporateAction();
+    /// @notice The oracle (or a contract it called) reverted with data that looks like a final rejection.
+    ///         Not final: the commit stays pending and refunds when its window ends.
+    error OracleReverted();
     error NotHolder();
     error NotWinner();
     error ZeroAmount();
@@ -152,6 +163,21 @@ interface IFallpitHook {
     /// @dev `setSigmaEff` again within `SIGMA_EFF_GAP` (5 minutes) of the round's last update. Raised by the
     ///      book (`IPitBook.stepSigmaEff`), as is `OnlyVolKeeper`.
     error SigmaEffTooSoon();
+    /// @dev `openStrike`: the round's clock does not trade at the print.
+    error StrikeWindow();
+    /// @dev `openStrike`: `m` is not the inner edge nearest to the print.
+    error StrikeEdge();
+    /// @dev `openStrike`: more than half of the round's variance is still ahead at the print.
+    error StrikeTooEarly();
+    /// @dev `openStrike`: `m` is less than two edges from the pair's edge (19) or from an open strike.
+    error StrikeTooClose();
+    /// @dev `openStrike`: a pair of the round is not pinned: the print is less than 0.84 remaining standard
+    ///      deviations (80/20) from the pair's edge 19 or from an open strike's edge.
+    error StrikeNotPinned();
+    /// @dev `openStrike`: the round already has 14 or 15 products.
+    error StrikeNoRoom();
+    /// @notice ETH sent by anyone but the oracle (its refunds are the only ETH the hook takes).
+    error EthNotAccepted();
 
     /// @notice The only contract that may fill and escrow (`fill`, `pull`).
     function router() external view returns (address);
@@ -172,7 +198,8 @@ interface IFallpitHook {
     function finalizeRound(bytes32 house, uint32 day) external;
 
     /// @notice Voids an open round that has no recorded close (a late one counts as none) 24 hours after
-    ///         its close. Anyone may call.
+    ///         its close, or whose close spans a corporate action (`CorporateAction`) at once. Anyone may
+    ///         call.
     ///         The house gets its capital back first, holders share what the round holds above it pro rata
     ///         to their cost basis (never more than that basis). (`openRound` of the house's next round
     ///         voids such a round the same way from 12 hours after its close.)
@@ -248,10 +275,26 @@ interface IFallpitHook {
     function getSupplies(bytes32 roundId)
         external
         view
-        returns (uint256[12] memory supply, uint256[12] memory premium);
+        returns (uint256[15] memory supply, uint256[15] memory premium);
+
+    /// @notice Opens a live strike in an open round: two more products on the round's grid, split at inner
+    ///         edge `m` (LOWER-m on bands `[0, m]`, HIGHER-m on `[m + 1, 39]`), priced from the same band
+    ///         state as the rest of the menu. Anyone may call, with the oracle print `report` of an instant
+    ///         `t` at most the round's `refundDelay` old, of the round's fill source (any ETH sent pays the
+    ///         oracle's update fee). Rules: the round's clock trades at the print; at most half of the
+    ///         round's variance is still ahead (`rho <= 0.5`); `m` is the edge nearest to the print
+    ///         (`FallpitLens.strikeEdgeAt`); `m` is at least two edges from 19 and from every open strike;
+    ///         the round has room (15 products at most).
+    function openStrike(bytes32 roundId, uint8 m, uint64 t, bytes calldata report) external payable;
+
+    /// @notice First guess for the lambda solves of the round's next fill (`ILadderMath.fillFrom`): the
+    ///         root its last fill returned, 0 before the first fill (the root of the zero state).
+    function seedOf(bytes32 roundId) external view returns (int256);
 
     /// @notice Pricing state `v` (at depth scale `g`) and opening depths `b0`. `b0` is set only for the latest
-    ///         round of its house (the only one that can trade); zero for an older one.
+    ///         round of its house (the only one that can trade); zero for an older one. The house keeps one
+    ///         pricing state: `v` is the zero state for a round before its first fill, and for an older round
+    ///         once the house's next round has traded.
     function getCurve(bytes32 roundId) external view returns (int256[40] memory v, uint256[40] memory b0);
 
     /// @notice Round and product index of a ticket id (the inverse of `tokenId`).

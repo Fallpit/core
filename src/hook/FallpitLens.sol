@@ -25,6 +25,8 @@ contract FallpitLens {
     ///        charged the minimum, not the model's price, so the multiple shown is the minimum price's and
     ///        not the odds. An app should grey the product out rather than advertise it. False when
     ///        nothing is priced
+    /// @param strike true for a product of a live strike (`IFallpitHook.openStrike`), false for one the round
+    ///        opened with
     /// @param id the product's ticket: an ERC-6909 id of the hook (`IFallpitHook.tokenId`)
     /// @param low price of the run's lower edge, WAD (0: none, the run starts at the bottom)
     /// @param high price of the run's upper edge, WAD (the largest uint256: none)
@@ -43,6 +45,7 @@ contract FallpitLens {
         bool capped;
         bool won;
         bool dead;
+        bool strike;
         uint256 id;
         uint256 low;
         uint256 high;
@@ -135,42 +138,78 @@ contract FallpitLens {
             RefundReason rejection
         )
     {
-        IFallpitHook.RoundConfig memory c = hook.getConfig(roundId);
-        IFallpitHook.RoundState memory st = hook.getState(roundId);
-        Pricing memory z = _pricing(roundId, c, st, product, price, ts);
-        ILadderMath.Fill memory f = _fill(z, isBuy, shares);
-        (chips, fee) = isBuy
-            ? PitMath.buyCost(f.amount, z.scale, shares, z.rate, z.vegaFee.mulWad(f.vega), z.minPrice)
-            : PitMath.sellProceeds(f.amount, z.scale, shares, z.rate, z.vegaFee.mulWad(f.vega));
-        (pBefore, pAfter, fillFee) = (f.pBefore, f.pAfter, c.params.fillFee);
+        QuoteResult memory q = _quote(Ask(roundId, product, isBuy, shares, price, ts));
+        return (q.chips, q.fee, q.pBefore, q.pAfter, q.fillFee, q.rejection);
+    }
 
-        // the round's books with this fill applied, as the hook writes them
-        (uint256[12] memory supply,) = hook.getSupplies(roundId);
-        if (isBuy) supply[product] += shares;
-        else supply[product] = supply[product] > shares ? supply[product] - shares : 0;
-        if (st.status != IFallpitHook.Status.Open) {
-            rejection = RefundReason.NotOpen;
-        } else if (
-            shares > c.maxFill || _risk(z, isBuy, shares, f.amount) > _riskLeft(roundId, c, z.ctx.gNew, ts)
-        ) {
-            rejection = RefundReason.Cap;
-        } else if (isBuy && PitMath.overCap(z.lo, z.hi, supply[product], c.capital, c.params.floorCapBps)) {
-            rejection = RefundReason.ProductCap;
-        } else if (!z.tradable) {
-            rejection = RefundReason.Window;
-        } else if (!isBuy && chips > st.held) {
-            rejection = RefundReason.Solvency;
-        } else {
-            rejection = PitMath.postFillCheck(
-                supply,
-                c.params.menu,
-                isBuy ? st.held + chips : st.held - chips,
-                st.protocolFees + fee * c.params.protocolFeeBps / PitMath.BPS,
-                c.capital,
-                c.params.lossLimitBps,
-                isBuy
-            );
+    /// @dev The arguments of `quote`.
+    struct Ask {
+        bytes32 roundId;
+        uint8 product;
+        bool isBuy;
+        uint256 shares;
+        uint256 price;
+        uint64 ts;
+    }
+
+    /// @dev What `quote` returns, and the engine's amount of the fill.
+    struct QuoteResult {
+        uint256 chips;
+        uint256 fee;
+        uint256 pBefore;
+        uint256 pAfter;
+        uint256 fillFee;
+        RefundReason rejection;
+        uint256 amount;
+    }
+
+    function _quote(Ask memory a) internal view returns (QuoteResult memory q) {
+        IFallpitHook.RoundConfig memory c = hook.getConfig(a.roundId);
+        IFallpitHook.RoundState memory st = hook.getState(a.roundId);
+        Pricing memory z = _pricing(a.roundId, c, st, a.product, a.price, a.ts);
+        {
+            ILadderMath.Fill memory f = _fill(z, a.isBuy, a.shares);
+            (q.chips, q.fee) = a.isBuy
+                ? PitMath.buyCost(f.amount, z.scale, a.shares, z.rate, z.vegaFee.mulWadUp(f.vega), z.minPrice)
+                : PitMath.sellProceeds(f.amount, z.scale, a.shares, z.rate, z.vegaFee.mulWadUp(f.vega));
+            (q.pBefore, q.pAfter, q.fillFee, q.amount) = (f.pBefore, f.pAfter, c.params.fillFee, f.amount);
         }
+        q.rejection = _rejection(a, c, st, z, q);
+    }
+
+    /// @dev The hook's checks of `quote`, in the hook's order, on the round's books with the fill applied
+    ///      as the hook writes them.
+    function _rejection(
+        Ask memory a,
+        IFallpitHook.RoundConfig memory c,
+        IFallpitHook.RoundState memory st,
+        Pricing memory z,
+        QuoteResult memory q
+    ) internal view returns (RefundReason) {
+        (uint256[15] memory supply,) = hook.getSupplies(a.roundId);
+        if (a.isBuy) supply[a.product] += a.shares;
+        else supply[a.product] = supply[a.product] > a.shares ? supply[a.product] - a.shares : 0;
+        if (st.status != IFallpitHook.Status.Open) return RefundReason.NotOpen;
+        if (
+            a.shares > c.maxFill
+                || _risk(z, a.isBuy, a.shares, q.amount) > _riskLeft(a.roundId, c, z.ctx.gNew, a.ts)
+        ) {
+            return RefundReason.Cap;
+        }
+        if (a.isBuy && PitMath.overCap(z.lo, z.hi, supply[a.product], c.capital, c.params.floorCapBps)) {
+            return RefundReason.ProductCap;
+        }
+        if (!z.tradable) return RefundReason.Window;
+        if (!a.isBuy && q.chips > st.held) return RefundReason.Solvency;
+        return PitMath.postFillCheck(
+            supply,
+            c.params.menu,
+            a.isBuy ? st.held + q.chips : st.held - q.chips,
+            st.protocolFees + q.fee * c.params.protocolFeeBps / PitMath.BPS,
+            c.capital,
+            c.params.lossLimitBps,
+            a.isBuy
+        );
     }
 
     /// @notice What a buy of product `product` costs all in, at oracle `price` (WAD) printed at `ts`, at
@@ -198,7 +237,7 @@ contract FallpitLens {
         for (uint256 i; i < 3; ++i) {
             ILadderMath.Fill memory f = _fill(z, true, shares[i]);
             (cost[i],) =
-                PitMath.buyCost(f.amount, z.scale, shares[i], z.rate, z.vegaFee.mulWad(f.vega), z.minPrice);
+                PitMath.buyCost(f.amount, z.scale, shares[i], z.rate, z.vegaFee.mulWadUp(f.vega), z.minPrice);
             if (cost[i] != 0) multiple[i] = shares[i] * PitMath.WAD / cost[i];
         }
     }
@@ -217,6 +256,7 @@ contract FallpitLens {
         ILadderMath.Ctx ctx;
         int256[40] v;
         uint256[40] b0;
+        int256 seed;
     }
 
     function _pricing(
@@ -237,6 +277,7 @@ contract FallpitLens {
         z.rate = PitMath.feeRate(c.params.baseFee, c.params.closeFee, c.params.feeRamp, c.closeTs, ts);
         (z.sigma, z.vegaFee, z.minPrice) = (c.sigma, c.params.vegaFee, c.params.minPriceWad);
         (z.v, z.b0) = hook.getCurve(roundId);
+        z.seed = hook.seedOf(roundId);
     }
 
     /// @dev The engine's fill of `shares` on the product of `z`, as the hook would compute it.
@@ -246,7 +287,9 @@ contract FallpitLens {
         returns (ILadderMath.Fill memory)
     {
         int256 delta = int256(shares * z.scale);
-        return math.fill(z.v, z.b0, z.sigma, z.ctx, z.lo, z.hi, isBuy ? delta : -delta);
+        (ILadderMath.Fill memory f,) =
+            math.fillFrom(z.v, z.b0, z.sigma, z.ctx, z.lo, z.hi, isBuy ? delta : -delta, z.seed);
+        return f;
     }
 
     /// @notice A round and its whole menu in one call: every product with its band run, its price range in
@@ -281,12 +324,14 @@ contract FallpitLens {
                 p = math.prices(v, b0, c.sigma, ILadderMath.Ctx({x: x, sd: sd, gOld: st.g, gNew: st.g}));
             }
         }
-        (uint256[12] memory supply, uint256[12] memory premium) = hook.getSupplies(roundId);
+        (uint256[15] memory supply, uint256[15] memory premium) = hook.getSupplies(roundId);
         uint256 n = PitMath.count(c.params.menu);
+        uint256 base = PitMath.strikeFrom(c.params.menu);
         m.products = new Product[](n);
         for (uint256 i; i < n; ++i) {
             Product memory q = m.products[i];
             (q.lo, q.hi) = PitMath.run(c.params.menu, i);
+            q.strike = i >= base;
             (q.low, q.high) = PitMath.bounds(c.s0, c.sigma, q.lo, q.hi);
             (q.id, q.supply, q.premium) = (hook.tokenId(roundId, uint8(i)), supply[i], premium[i]);
             q.capped = PitMath.capped(q.lo, q.hi);
@@ -307,12 +352,33 @@ contract FallpitLens {
         }
     }
 
+    /// @notice The live strike a print would open (`IFallpitHook.openStrike`): `m` is the inner edge nearest
+    ///         to oracle `price` (WAD) on the round's grid, and `ok` is true when a print at `ts` with that
+    ///         price may open it now: the round is open, its clock trades at `ts`, at most half of its
+    ///         variance is ahead, `m` keeps its distance from 19 and the open strikes, every pair is pinned
+    ///         (`PitMath.strikeCheck`), and there is room. The hook also needs the print's instant to be at
+    ///         most `PitMath.STRIKE_MAX_LAG` seconds old and inside the refund window.
+    function strikeEdgeAt(bytes32 roundId, uint256 price, uint64 ts)
+        external
+        view
+        returns (uint8 m, bool ok)
+    {
+        IFallpitHook.RoundConfig memory c = hook.getConfig(roundId);
+        if (c.s0 == 0 || price == 0) return (0, false);
+        IFallpitHook.RoundState memory st = hook.getState(roundId);
+        (uint256 rho, bool tradable) = PitClock.at(c.clock, ts);
+        (int256 x, uint256 sd,) = PitMath.context(hook.sigmaEffOf(roundId), rho, c.s0, price, st.g);
+        m = PitMath.nearestEdge(c.sigma, x);
+        ok = tradable && st.status == IFallpitHook.Status.Open
+            && PitMath.strikeCheck(c.params.menu, m, rho, c.sigma, x, sd) == PitMath.StrikeRule.None;
+    }
+
     /// @notice Pooled solvency of a round: the worst payout over the 40 bands, and the chips that cover
     ///         it (held minus protocol fees).
     function solvency(bytes32 roundId) external view returns (uint256 worstPayout, uint256 covered) {
         IFallpitHook.RoundConfig memory c = hook.getConfig(roundId);
         IFallpitHook.RoundState memory st = hook.getState(roundId);
-        (uint256[12] memory supply,) = hook.getSupplies(roundId);
+        (uint256[15] memory supply,) = hook.getSupplies(roundId);
         return (PitMath.maxPayout(supply, c.params.menu), st.held - st.protocolFees);
     }
 
@@ -320,7 +386,7 @@ contract FallpitLens {
     ///         products whose run contains band j, the chips winners take if the close lands there.
     function payouts(bytes32 roundId) external view returns (uint256[40] memory payout) {
         uint256 menu = hook.getConfig(roundId).params.menu;
-        (uint256[12] memory supply,) = hook.getSupplies(roundId);
+        (uint256[15] memory supply,) = hook.getSupplies(roundId);
         uint256 n = PitMath.count(menu);
         for (uint256 i; i < n; ++i) {
             (uint8 lo, uint8 hi) = PitMath.run(menu, i);
@@ -338,7 +404,7 @@ contract FallpitLens {
     function lossLimit(bytes32 roundId) public view returns (uint256 cushion, uint256 floor) {
         IFallpitHook.RoundConfig memory c = hook.getConfig(roundId);
         IFallpitHook.RoundState memory st = hook.getState(roundId);
-        (uint256[12] memory supply,) = hook.getSupplies(roundId);
+        (uint256[15] memory supply,) = hook.getSupplies(roundId);
         uint256 need = PitMath.maxPayout(supply, c.params.menu) + st.protocolFees;
         cushion = st.held > need ? st.held - need : 0;
         floor = c.capital * (PitMath.BPS - c.params.lossLimitBps) / PitMath.BPS;
@@ -429,7 +495,7 @@ contract FallpitLens {
         IFallpitHook.RoundConfig c;
         IFallpitHook.RoundState st;
         Pricing z;
-        uint256[12] supply;
+        uint256[15] supply;
         uint256 left;
         uint8 product;
     }
@@ -447,7 +513,7 @@ contract FallpitLens {
         ILadderMath.Fill memory f = _fill(q.z, true, shares);
         if (_risk(q.z, true, shares, f.amount) > q.left) return false;
         (uint256 chips, uint256 fee) =
-            PitMath.buyCost(f.amount, q.z.scale, shares, q.z.rate, q.z.vegaFee.mulWad(f.vega), q.z.minPrice);
+            PitMath.buyCost(f.amount, q.z.scale, shares, q.z.rate, q.z.vegaFee.mulWadUp(f.vega), q.z.minPrice);
         q.supply[q.product] = supplied;
         ok = PitMath.postFillCheck(
             q.supply,

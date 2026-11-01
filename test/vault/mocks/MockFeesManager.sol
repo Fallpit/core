@@ -97,8 +97,8 @@ contract MockFeesManager {
     }
 
     function updateBeneficiary(bytes32 poolId, address newBeneficiary) external nonReentrant {
-        require(newBeneficiary != msg.sender, InvalidNewBeneficiary());
-        if (strict) require(getShares[poolId][msg.sender] > 0, CallerNotBeneficiary());
+        if (newBeneficiary == msg.sender) revert InvalidNewBeneficiary();
+        if (strict && getShares[poolId][msg.sender] == 0) revert CallerNotBeneficiary();
 
         _releaseFees(poolId, msg.sender);
         _releaseFees(poolId, newBeneficiary);

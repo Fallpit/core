@@ -94,7 +94,9 @@ abstract contract StandardMenu {
     /// @dev The beginner pair at the previous close.
     uint8 internal constant LOWER = 8; // bands 0 to 19
     uint8 internal constant HIGHER = 9; // bands 20 to 39
-    /// @dev Number of products of the default menu, and the most a menu can have.
+    /// @dev Number of products of the default menu, the most a menu can have, and the most a round can have
+    ///      with its live strikes.
     uint256 internal constant PRODUCTS = 10;
-    uint256 internal constant MAX_PRODUCTS = 12;
+    uint256 internal constant MAX_MENU = 12;
+    uint256 internal constant MAX_PRODUCTS = 15;
 }

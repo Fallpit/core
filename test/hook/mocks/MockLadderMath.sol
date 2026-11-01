@@ -91,8 +91,8 @@ contract MockLadderMath is ILadderMath {
     }
 
     /// @inheritdoc ILadderMath
-    function depths(uint256[10] calldata packed, uint256 capital, uint256 alpha)
-        external
+    function depths(uint256[10] memory packed, uint256 capital, uint256 alpha)
+        public
         pure
         returns (uint256[40] memory b0)
     {
@@ -114,14 +114,14 @@ contract MockLadderMath is ILadderMath {
 
     /// @inheritdoc ILadderMath
     function fill(
-        int256[40] calldata v,
-        uint256[40] calldata b0,
+        int256[40] memory v,
+        uint256[40] memory b0,
         uint256 sigma,
-        Ctx calldata ctx,
+        Ctx memory ctx,
         uint8 lo,
         uint8 hi,
         int256 delta
-    ) external pure virtual returns (Fill memory f) {
+    ) public pure virtual returns (Fill memory f) {
         if (ctx.gNew > ctx.gOld) revert DepthIncrease();
         uint256[40] memory pi = prior(sigma, ctx.x, ctx.sd);
         f.v = v;
@@ -154,7 +154,40 @@ contract MockLadderMath is ILadderMath {
         f.vega = VEGA;
     }
 
-    function _depths(uint256[40] calldata b0, uint256 g) private pure returns (uint256[40] memory b) {
+    /// @dev The mock solves from cold: the seed is ignored and no root is handed back.
+    function fillFrom(
+        int256[40] calldata v,
+        uint256[40] calldata b0,
+        uint256 sigma,
+        Ctx calldata ctx,
+        uint8 lo,
+        uint8 hi,
+        int256 delta,
+        int256
+    ) external pure returns (Fill memory f, int256 lambda) {
+        f = fill(v, b0, sigma, ctx, lo, hi, delta);
+        lambda = 0;
+    }
+
+    /// @dev The mock's fill on the unpacked state and the derived depths, cold, packed back.
+    function fillPacked(PackedIn calldata a, Ctx calldata ctx, uint8 lo, uint8 hi, int256 delta, int256)
+        external
+        pure
+        returns (PackedFill memory p)
+    {
+        int256[40] memory v;
+        for (uint256 k; k < 20; ++k) {
+            v[2 * k] = int256(int128(uint128(a.v[k])));
+            v[2 * k + 1] = int256(a.v[k]) >> 128;
+        }
+        Fill memory f = fill(v, depths(a.lnInv, a.capital, a.alpha), a.sigma, ctx, lo, hi, delta);
+        for (uint256 k; k < 20; ++k) {
+            p.v[k] = uint256(uint128(int128(f.v[2 * k]))) | uint256(f.v[2 * k + 1]) << 128;
+        }
+        (p.amount, p.pBefore, p.pAfter, p.vega) = (f.amount, f.pBefore, f.pAfter, f.vega);
+    }
+
+    function _depths(uint256[40] memory b0, uint256 g) private pure returns (uint256[40] memory b) {
         for (uint8 j; j < 40; ++j) {
             b[j] = b0[j] * g / WAD;
         }

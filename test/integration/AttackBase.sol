@@ -69,7 +69,7 @@ abstract contract AttackBase is IntegrationFixture {
         for (uint256 j; j < 40; ++j) {
             assertEq(v[j], 0);
         }
-        (uint256[12] memory supply, uint256[12] memory premium) = hook.getSupplies(roundId);
+        (uint256[15] memory supply, uint256[15] memory premium) = hook.getSupplies(roundId);
         for (uint256 i; i < MAX_PRODUCTS; ++i) {
             assertEq(supply[i], 0);
             assertEq(premium[i], 0);

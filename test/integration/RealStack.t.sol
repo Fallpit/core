@@ -27,6 +27,26 @@ contract RealStackTest is StackFixture {
     ///      cutoff. Checks: no fill ever reverts (the helpers do not catch), a fill stays under 6M gas,
     ///      the round is solvent after every fill, every chip is accounted for at the end, the hook's
     ///      claims equal what it owes to the unit, and the house unlocks.
+    /// @dev One trade of `testFuzz_neverBricks_staysSolvent_conserves`, drawn from `seed`; returns its gas.
+    function _step(uint256 seed, uint8 idx, uint256 px) internal returns (uint256 used) {
+        uint256 size = 1 + (seed >> 64) % 20_000e18;
+        if ((seed >> 60) % 4 == 0) size = 20_000e18;
+        uint256 bal = _token(idx).balanceOf(eve);
+        bool sell = bal != 0 && (seed >> 50) % 2 == 0;
+        if (sell && size > bal) size = bal;
+        // a size under the round's minimum trade cannot be committed at all (BelowMinimumTrade): a dust
+        // remainder stays in the wallet until the close, where it redeems if it wins
+        (,,,,, uint256 minShares,,) = hook.commitContext(roundId, idx);
+        bool dust = size < minShares;
+        uint256 g0 = gasleft();
+        if (dust) {} else if (sell) {
+            _trySell(eve, idx, size, px);
+        } else {
+            _tryBuy(eve, idx, size, px);
+        }
+        used = g0 - gasleft();
+    }
+
     /// forge-config: default.fuzz.runs = 100
     function testFuzz_neverBricks_staysSolvent_conserves(uint256 seed) public {
         _lpDeposit(lp, CAPITAL);
@@ -45,24 +65,10 @@ contract RealStackTest is StackFixture {
             k += step;
             if (k > 12e18) k = 12e18;
             if (k < -12e18) k = -12e18;
-            uint256 px = _priceAtSigmas(k);
-            uint256 size = 1 + (seed >> 64) % 20_000e18;
-            if ((seed >> 60) % 4 == 0) size = 20_000e18;
-            uint256 bal = _token(idx).balanceOf(eve);
-            bool sell = bal != 0 && (seed >> 50) % 2 == 0;
-            if (sell && size > bal) size = bal;
-            // a size under the round's minimum trade cannot be committed at all (BelowMinimumTrade): a dust
-            // remainder stays in the wallet until the close, where it redeems if it wins
-            (,,,,, uint256 minShares,,) = hook.commitContext(roundId, idx);
-            bool dust = size < minShares;
-            uint256 g0 = gasleft();
-            if (dust) {} else if (sell) {
-                _trySell(eve, idx, size, px);
-            } else {
-                _tryBuy(eve, idx, size, px);
+            {
+                uint256 used = _step(seed, idx, _priceAtSigmas(k));
+                if (used > maxGas) maxGas = used;
             }
-            uint256 used = g0 - gasleft();
-            if (used > maxGas) maxGas = used;
             (uint256 worst, uint256 covered) = lens.solvency(roundId);
             assertLe(worst, covered, "solvent after every fill");
             _warp(clock + uint64((seed >> 100) % 900));
@@ -249,7 +255,7 @@ contract RealStackTest is StackFixture {
                 assertTrue(filled);
             }
         }
-        (uint256[12] memory supply,) = hook.getSupplies(roundId);
+        (uint256[15] memory supply,) = hook.getSupplies(roundId);
         for (uint256 i; i < MAX_PRODUCTS; ++i) {
             assertEq(supply[i], 0);
         }

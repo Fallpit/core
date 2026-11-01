@@ -59,6 +59,14 @@ contract DeployMainnetForkTest is Test {
         for (uint256 i; i < s.length; ++i) {
             sources.push(s[i]);
         }
+        // two-step: OWNER asks for each role, then the deployer completes the hand-over
+        vm.startPrank(roles.owner);
+        c.oracle.requestOwnershipHandover();
+        c.guard.requestOwnershipHandover();
+        c.treasury.requestOwnershipHandover();
+        c.registry.requestOwnershipHandover();
+        c.lister.requestOwnershipHandover();
+        vm.stopPrank();
         script.handOverForTest(c, roles.owner);
     }
 

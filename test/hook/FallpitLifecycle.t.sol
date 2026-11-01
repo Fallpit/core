@@ -148,7 +148,7 @@ contract FallpitLifecycleTest is HookFixture {
     function test_postFillCheck_solvencyForAll_lossLimitForBuysOnly() public pure {
         // worst band pays 90: products 0 and 5 both win between the bottom and the middle strike
         uint256 m = Menus.thresholds();
-        uint256[12] memory s;
+        uint256[15] memory s;
         s[0] = 60;
         s[5] = 30;
         assertEq(PitMath.maxPayout(s, m), 90);
@@ -210,7 +210,7 @@ contract FallpitLifecycleTest is HookFixture {
         assertEq(PitMath.winners(m, 23), uint16(1 | 4 | 32));
         assertEq(PitMath.winners(m, 24), uint16(1 | 4 | 16));
         assertEq(PitMath.winners(m, 39), uint16(1 | 4 | 16));
-        uint256[12] memory s;
+        uint256[15] memory s;
         (s[0], s[1], s[2], s[3], s[4], s[5]) = (1, 20, 300, 4000, 50_000, 600_000);
         // the four regions of the three strikes: L15+L19+L23, H15+L19+L23, H15+H19+L23, H15+H19+H23
         assertEq(PitMath.maxPayout(s, m), 20 + 4000 + 600_000);
@@ -257,13 +257,16 @@ contract FallpitLifecycleTest is HookFixture {
         router.fill(id, report);
         assertEq(uint8(router.getCommit(id).status), uint8(IFallpitRouter.CommitStatus.Pending));
 
-        // ETH sent with the fill reaches the oracle through the hook; the change stays in the hook
+        // ETH sent with the fill reaches the oracle through the hook; the change goes back to the filler
+        // with the commit's fill fee
+        uint256 fee = router.getCommit(id).fillFee;
         vm.deal(keeper, 1 ether);
         vm.prank(keeper);
         assertTrue(router.fill{value: 0.01 ether}(id, report));
         assertEq(address(oracle).balance, 0.001 ether);
-        assertEq(address(hook).balance, 0.009 ether);
+        assertEq(address(hook).balance, 0);
         assertEq(address(router).balance, 0);
+        assertEq(keeper.balance, 1 ether - 0.001 ether + fee);
     }
 
     // --------------------------------------------------------------------------------------------
@@ -316,7 +319,7 @@ contract FallpitLifecycleTest is HookFixture {
         vm.expectRevert(IPitBook.DisputeNotAllowed.selector);
         vm.prank(guardian);
         book.dispute(roundId);
-        vm.expectRevert(IFallpitHook.WrongStatus.selector);
+        vm.expectRevert(IFallpitHook.VoidNotAllowed.selector);
         vm.prank(guardian);
         hook.voidRound(house, day);
         hook.finalizeRound(house, day);
@@ -372,7 +375,7 @@ contract FallpitLifecycleTest is HookFixture {
         _buy(bob, HIGHER, 1_000e18, S0 * 1001 / 1000);
         uint256 carolCost = _buy(carol, F5, 3_000e18, S0); // a floor (was LOWER at +1 sigma)
         _sell(alice, HIGHER, 500e18, S0);
-        (, uint256[12] memory premium) = hook.getSupplies(roundId);
+        (, uint256[15] memory premium) = hook.getSupplies(roundId);
         IFallpitHook.RoundState memory open = _state();
 
         // the close is never recorded; a day later anyone voids

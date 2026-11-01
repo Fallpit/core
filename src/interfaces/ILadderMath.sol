@@ -33,6 +33,31 @@ interface ILadderMath {
         uint256 vega;
     }
 
+    /// @notice The inputs of `fillPacked`: the state in its packed form and what the depths are derived from.
+    /// @param v state, two bands a word: band 2k in the low 128 bits of word k, band 2k+1 in the high 128
+    ///        bits, each a signed 128-bit number (the hook's storage form, `PackedBands`)
+    /// @param lnInv `openLnInv(sigma)` of the round's house
+    /// @param capital round capital in wei, as `depths` takes it
+    /// @param alpha depth parameter, as `depths` takes it
+    /// @param sigma the round's frozen sigma
+    struct PackedIn {
+        uint256[20] v;
+        uint256[10] lnInv;
+        uint256 capital;
+        uint256 alpha;
+        uint256 sigma;
+    }
+
+    /// @notice `Fill` with the new state packed as in `PackedIn.v`, and the root of that state.
+    struct PackedFill {
+        uint256[20] v;
+        uint256 amount;
+        uint256 pBefore;
+        uint256 pAfter;
+        uint256 vega;
+        int256 lambda;
+    }
+
     /// @notice Depth per band at the open: b0[j] = alpha * capital / ln(1 / pi_j(open)), with
     ///         pi(open) = prior(sigma, 0, sigma).
     function openDepths(uint256 sigma, uint256 capital, uint256 alpha)
@@ -76,6 +101,28 @@ interface ILadderMath {
         uint8 hi,
         int256 delta
     ) external pure returns (Fill memory);
+
+    /// @notice `fill` with a first guess for its lambda solves (`type(int256).min` for none), for example
+    ///         the root the previous fill of the round returned. A seed outside a solve's bracket is
+    ///         ignored. The result equals `fill`'s up to the solve's tolerance.
+    /// @return lambda the root of the returned state at depth scale gNew (the next fill's seed)
+    function fillFrom(
+        int256[40] calldata v,
+        uint256[40] calldata b0,
+        uint256 sigma,
+        Ctx calldata ctx,
+        uint8 lo,
+        uint8 hi,
+        int256 delta,
+        int256 seed
+    ) external pure returns (Fill memory, int256 lambda);
+
+    /// @notice `fillFrom` on the packed state with the depths `depths(a.lnInv, a.capital, a.alpha)`, in one
+    ///         call: what the hook calls. Equal to `depths` followed by `fillFrom`, reverts included.
+    function fillPacked(PackedIn calldata a, Ctx calldata ctx, uint8 lo, uint8 hi, int256 delta, int256 seed)
+        external
+        pure
+        returns (PackedFill memory);
 
     /// @notice Log return of inner edge m (0..38): (m - 19) * sigma / 4.
     function edge(uint256 sigma, uint8 m) external pure returns (int256);

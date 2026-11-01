@@ -76,7 +76,7 @@ contract FloorsTest is IntegrationFixture {
         }
         _assertSupplies();
         _assertHookSolvent(address(chip));
-        (uint256[12] memory supply,) = hook.getSupplies(roundId);
+        (uint256[15] memory supply,) = hook.getSupplies(roundId);
         IFallpitHook.RoundState memory open = _state();
 
         // closes in sigmas from the previous close, and the floor each lands in
@@ -175,27 +175,33 @@ contract FloorsTest is IntegrationFixture {
         uint256 bobCost = _buy(bob, HIGHER, 15_000e18, S0);
         uint256 carolCost = _buy(carol, LOWER, 8_000e18, S0) + _buy(carol, F2, 4_000e18, S0);
         // the worst band is where the floor and HIGHER overlap: both are owed there
-        (uint256 worst,) = lens.solvency(roundId);
-        assertEq(worst, 25_000e18);
+        {
+            (uint256 worst,) = lens.solvency(roundId);
+            assertEq(worst, 25_000e18);
+        }
         assertEq(lens.payouts(roundId)[22], 25_000e18);
         assertEq(lens.payouts(roundId)[25], 15_000e18);
         assertEq(lens.payouts(roundId)[16], 12_000e18);
         IFallpitHook.RoundState memory open = _state();
 
         _closeAndFinalize(_priceAtSigmas(0.75e18)); // inside F5, and above the previous close
-        IFallpitHook.RoundState memory fin = _state();
-        assertEq(fin.winners, uint16(1 << F5 | 1 << HIGHER));
-        assertEq(fin.payoutOwed, 25_000e18, "the floor's holders and HIGHER's holders, each in full");
-        uint256 floor = _token(F5).id;
-        uint256 higher = _token(HIGHER).id;
-        vm.prank(alice);
-        assertEq(router.redeem(floor, 10_000e18), 10_000e18);
-        vm.prank(bob);
-        assertEq(router.redeem(higher, 15_000e18), 15_000e18);
-        uint256 lower = _token(LOWER).id;
-        vm.prank(carol);
-        vm.expectRevert(IFallpitHook.NotWinner.selector);
-        router.redeem(lower, 8_000e18);
+        {
+            IFallpitHook.RoundState memory fin = _state();
+            assertEq(fin.winners, uint16(1 << F5 | 1 << HIGHER));
+            assertEq(fin.payoutOwed, 25_000e18, "the floor's holders and HIGHER's holders, each in full");
+        }
+        {
+            uint256 floor = _token(F5).id;
+            uint256 higher = _token(HIGHER).id;
+            vm.prank(alice);
+            assertEq(router.redeem(floor, 10_000e18), 10_000e18);
+            vm.prank(bob);
+            assertEq(router.redeem(higher, 15_000e18), 15_000e18);
+            uint256 lower = _token(LOWER).id;
+            vm.prank(carol);
+            vm.expectRevert(IFallpitHook.NotWinner.selector);
+            router.redeem(lower, 8_000e18);
+        }
 
         uint256 fees = hook.collectProtocolFees(address(chip));
         uint256 back = chip.balanceOf(address(vault));
@@ -445,6 +451,37 @@ contract FloorsTest is IntegrationFixture {
         }
     }
 
+    /// @dev A set bought at one print (`_buySetAtOnePrint`): the buyer, the products, the size, the
+    ///      price, the escrow of each commit, the print and the commits.
+    struct SetBuy {
+        address user;
+        uint8[] set;
+        uint256 shares;
+        uint256 price;
+        uint256 escrow;
+        bytes report;
+        uint256[] ids;
+    }
+
+    /// @dev Fills commit `i` of `b` as the keeper and checks that it charges the lens's quote for the same
+    ///      print. Returns the engine's charge before fees and the cost.
+    function _buyOne(SetBuy memory b, uint256 i) internal returns (uint256 engine, uint256 cost) {
+        RefundReason rejection;
+        uint256 fee;
+        (cost, fee,,,, rejection) = lens.quote(roundId, b.set[i], true, b.shares, _grid(b.price), clock);
+        assertEq(uint8(rejection), uint8(RefundReason.None));
+        engine = cost - fee;
+        uint256 before = chip.balanceOf(b.user);
+        vm.prank(keeper);
+        assertTrue(router.fill(b.ids[i], b.report));
+        // the escrow of this commit came back less the cost
+        assertEq(
+            b.escrow - (chip.balanceOf(b.user) - before),
+            cost,
+            "the fill charges the quote for the same print"
+        );
+    }
+
     /// @dev Buys `shares` of every product of `set` at ONE print: all commits are made in the same second,
     ///      so one print prices them all, and they fill one after the other. Returns what the engine
     ///      charged before fees (the sum of every fill's cost, minimum price included) and the chips
@@ -453,23 +490,16 @@ contract FloorsTest is IntegrationFixture {
         internal
         returns (uint256 beforeFees, uint256 paid)
     {
-        uint256[] memory ids = new uint256[](set.length);
-        uint256 start = chip.balanceOf(user);
+        SetBuy memory b = SetBuy(
+            user, set, shares, price, chip.balanceOf(user) / set.length, "", new uint256[](set.length)
+        );
         for (uint256 i; i < set.length; ++i) {
-            ids[i] = _commitBuy(user, set[i], shares, start / set.length);
+            b.ids[i] = _commitBuy(user, set[i], shares, b.escrow);
         }
-        bytes memory report = _printFor(ids[0], price);
+        b.report = _printFor(b.ids[0], price);
         for (uint256 i; i < set.length; ++i) {
-            (uint256 quoted, uint256 fee,,,, RefundReason rejection) =
-                lens.quote(roundId, set[i], true, shares, _grid(price), clock);
-            assertEq(uint8(rejection), uint8(RefundReason.None));
-            uint256 before = chip.balanceOf(user);
-            vm.prank(keeper);
-            assertTrue(router.fill(ids[i], report));
-            // the escrow of this commit came back less the cost
-            uint256 cost = start / set.length - (chip.balanceOf(user) - before);
-            assertEq(cost, quoted, "the fill charges the quote for the same print");
-            beforeFees += quoted - fee;
+            (uint256 engine, uint256 cost) = _buyOne(b, i);
+            beforeFees += engine;
             paid += cost;
         }
     }
@@ -657,7 +687,7 @@ contract FloorsTest is IntegrationFixture {
         }
         _assertSupplies();
         _assertHookSolvent(address(chip));
-        (uint256[12] memory supply,) = hook.getSupplies(roundId);
+        (uint256[15] memory supply,) = hook.getSupplies(roundId);
         IFallpitHook.RoundState memory open = _state();
         (uint256 worst, uint256 covered) = lens.solvency(roundId);
         assertLe(worst, covered);

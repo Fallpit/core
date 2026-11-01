@@ -10,6 +10,8 @@ import {IFallpitHook} from "../interfaces/IFallpitHook.sol";
 import {NYTime} from "../lib/NYTime.sol";
 import {PitClock} from "./PitClock.sol";
 import {PitMath} from "./PitMath.sol";
+import {PitBookRules} from "./PitBookRules.sol";
+import {PitBookLogic} from "./PitBookLogic.sol";
 
 /// @title PitBook
 /// @notice Closes, per-ticker volatility, the trading calendar and clock, default round parameters (the
@@ -34,15 +36,11 @@ contract PitBook is IPitBook {
 
     uint256 private constant WAD = 1e18;
     uint256 private constant BPS = 10_000;
-    uint256 private constant EWMA_KEEP = 94;
-    /// @dev A daily squared return enters the EWMA at most at (4 sigma)^2, sigma the variance's own before
-    ///      the step: one jump (a crash, a missed corporate action) moves the variance by a bounded factor.
-    uint256 private constant MAX_STEP_IN_VARIANCES = 16;
-    uint256 private constant MIN_VAR = 0.005e18 * 0.005e18 / WAD;
-    uint256 private constant MAX_VAR = 0.15e18 * 0.15e18 / WAD;
+    uint256 private constant MIN_VAR = PitBookRules.MIN_VAR;
+    uint256 private constant MAX_VAR = PitBookRules.MAX_VAR;
     /// @dev The close a round starts from is at most this many calendar days back: a Wednesday close
     ///      before two skipped days and a weekend is five days before Monday; six leaves one to spare.
-    uint32 private constant MAX_CLOSE_AGE = 6;
+    uint32 private constant MAX_CLOSE_AGE = PitBookLogic.MAX_CLOSE_AGE;
     /// @notice How long after its instant anyone may record a close; later only the owner may.
     uint64 public constant CLOSE_RECORD_WINDOW = 3 days;
     /// @notice Delay between the owner announcing new default parameters, a new ticker, a ticker reseed or
@@ -53,74 +51,20 @@ contract PitBook is IPitBook {
     /// @notice How long after its instant a disputed keeper close stays open for replacement. One hour: the
     ///         rounds on a disputed close finalize at 17:00 New York and the next rounds still open in the
     ///         after-hours of the same evening, so a dispute costs the ticker an hour of trading, not a day.
-    uint64 public constant DISPUTE_WINDOW = 1 hours;
+    uint64 public constant DISPUTE_WINDOW = PitBookLogic.DISPUTE_WINDOW;
     /// @notice A close not recorded this long after its instant is missed (`PitClock.MISSED_CLOSE`).
     uint64 public constant MISSED_CLOSE = PitClock.MISSED_CLOSE;
     /// @notice Least `OWNER_DELAY` on a mainnet chain (4663, 1, 42161, 8453).
     uint64 public constant MIN_MAINNET_DELAY = 24 hours;
 
-    // bounds of the learned sigma (`stepSigmaEff`)
+    // bounds of the learned sigma (`stepSigmaEff`; the others are in `PitBookLogic`)
     /// @notice Least time between two updates of one round's learned sigma.
-    uint256 public constant SIGMA_EFF_GAP = 5 minutes;
-    /// @dev One update moves the sigma in force by at most 10%, up or down.
-    uint256 private constant SIGMA_STEP_BPS = 1000;
-    /// @dev The learned sigma stays within [0.8, 1.5] x the round's frozen sigma.
-    uint256 private constant SIGMA_LO_BPS = 8000;
-    uint256 private constant SIGMA_HI_BPS = 15_000;
-    /// @dev The product of all rises of one round's learned sigma is at most 1.5 (WAD): once the round has
-    ///      risen by 1.5x in total, it can only fall. So a vol keeper cannot cycle the sigma up and down.
-    uint256 private constant SIGMA_RISE_CAP = 1.5e18;
+    uint256 public constant SIGMA_EFF_GAP = PitBookLogic.SIGMA_EFF_GAP;
 
-    // hard bounds of the owner-set defaults
-    uint256 private constant MAX_ALPHA = 0.79e18;
-    uint256 private constant MIN_BASE_FEE = 0.005e18;
-    uint256 private constant MAX_BASE_FEE = 0.1e18;
-    uint256 private constant MAX_CLOSE_FEE = 0.2e18;
-    uint256 private constant MAX_VEGA_FEE = 1e18;
-    uint256 private constant MAX_FEE_RAMP = 6.5 hours;
-    /// @dev The next round of a house opens only when this one is final, and trades in the after-hours
-    ///      from then on: the window is short. Five minutes is the least a guardian can act in.
-    uint256 private constant MIN_CHALLENGE = 5 minutes;
-    uint256 private constant MAX_CHALLENGE = 1 hours;
-    /// @dev A commit is priced at least two seconds after it was made: one second is the resolution of
-    ///      both clocks (the chain's and the oracle's), so one more keeps the print out of sight.
-    uint256 private constant MIN_FILL_DELAY = 2;
-    uint256 private constant MAX_FILL_DELAY = 60;
-    /// @dev An unfilled commit stays fillable at its old print for this long: short, because for that
-    ///      time it is an option on the price for its owner.
-    uint256 private constant MIN_REFUND_DELAY = 10;
-    uint256 private constant MAX_REFUND_DELAY = 120;
-    /// @dev A regular session with less than this share of the variance would make the prior a near
-    ///      point mass at the open.
-    uint256 private constant MIN_REGULAR_WEIGHT = 2500;
-    uint256 private constant MAX_PROTOCOL_FEE_BPS = 5000;
-    /// @dev Smallest `alpha * minCapital` (alpha in WAD, minCapital in whole chips). `ILadderMath.openDepths`
-    ///      refuses a depth below 1e14 wei, and the depth of band j is `alpha * capital / ln(1 / pi_j)` with
-    ///      `ln(1 / pi_j)` below 9.3 for the floored prior. A round opens with at least `minCapital` whole
-    ///      chips, which is `minCapital * 1e18` in the math's WAD units whatever the chip's decimals, so
-    ///      `alpha * minCapital >= 9.3e14` opens every band. This bound keeps a margin on top.
-    uint256 private constant MIN_ALPHA_TIMES_CAPITAL = 1e15;
-    /// @dev `ILadderMath.openDepths` refuses a capital above 1e33 wei (1e15 whole chips).
-    uint256 private constant MAX_MIN_CAPITAL = 1e15;
-    /// @dev Bounds of the smallest trade: a millionth of a token to a thousand tokens.
-    uint256 private constant MIN_MIN_TRADE = 1e12;
-    uint256 private constant MAX_MIN_TRADE = 1_000e18;
-    /// @dev Bounds of the per-round loss limit: a round may always put a tenth of its capital at risk
-    ///      (less would stop ordinary trading at alpha 0.2), and never more than all of it.
-    uint256 private constant MIN_LOSS_LIMIT_BPS = 1000;
-    /// @dev Bounds of the risk budget per print second: from a tenth of a percent of capital to all of it
-    ///      (the default is 300; the top of the range leaves the budget out of the way).
-    uint256 private constant MIN_RISK_CAP_BPS = 10;
-    uint256 private constant MAX_RISK_CAP_BPS = 10_000;
-    /// @dev The floor of g (PitMath.G_FLOOR): the smallest risk budget is riskCapBps * 0.3.
-    uint256 private constant G_FLOOR_TENTHS = 3;
-    /// @dev The fill fee pays a filler's gas, nothing more: a hundred times the default is the ceiling.
-    uint256 private constant MAX_FILL_FEE = 0.01 ether;
+    // defaults (the hard bounds of the owner-set defaults are in `PitBookRules`)
     /// @dev A fill is about 3.5M gas. At Robinhood Chain's 0.02 gwei that is 0.00007 ETH; with a margin of
     ///      30% for a busier chain, 0.000091 ETH, rounded to 0.0001.
-    uint64 private constant DEFAULT_FILL_FEE = 0.0001 ether;
-    /// @dev A buy is never charged more than a fifth of a chip per token by the minimum price alone.
-    uint256 private constant MAX_MIN_PRICE = 0.2e18;
+    uint64 private constant DEFAULT_FILL_FEE = 0.000025 ether;
     /// @notice The menu a round gets unless the owner set another: 10 products (`PitMath` has the layout
     ///         of the word). Eight floors that partition the 40 bands, in standard deviations of the day
     ///         from the previous close: below -2, -2 to -1, -1 to -0.5, -0.5 to 0, 0 to 0.5, 0.5 to 1,
@@ -136,7 +80,8 @@ contract PitBook is IPitBook {
         | (0x1300 << 136) // LOWER: bands 0 to 19
         | (0x2714 << 152); // HIGHER: bands 20 to 39
 
-    /// @dev One recorded close. `multiplier` is the stock token's `uiMultiplier` when it was recorded.
+    /// @dev One recorded close. `multiplier` is the stock token's `uiMultiplier` when it was first recorded
+    ///      (a replacement keeps it).
     ///      `late`: first recorded more than `MISSED_CLOSE` after its instant, so it settles no round.
     struct Close {
         uint128 price;
@@ -152,8 +97,15 @@ contract PitBook is IPitBook {
     address public immutable deployer;
     /// @notice The Fallpit hook whose rounds `dispute` reads. Set once by the deployer.
     address public hook;
-    /// @inheritdoc IPitBook
-    mapping(bytes32 roundId => mapping(uint64 ts => uint256)) public riskUsed;
+
+    /// @dev The latest print a fill of a round was priced by, and the risk the fills of that print took.
+    struct RiskSum {
+        uint64 ts;
+        uint192 used;
+    }
+
+    /// @dev Per round, the latest print a fill was priced by and the risk its fills took (`takeRisk`).
+    mapping(bytes32 roundId => RiskSum) internal _riskSum;
     /// @inheritdoc IPitBook
     mapping(bytes32 roundId => SigmaEffState) public sigmaEffState;
 
@@ -231,8 +183,11 @@ contract PitBook is IPitBook {
         });
     }
 
-    /// @notice Accepts the oracle's refund of an unused update fee during `recordClose`.
-    receive() external payable {}
+    /// @notice Accepts the oracle's refund of an unused update fee during `recordClose`, and nothing else:
+    ///         ETH from anyone else would have no way out.
+    receive() external payable {
+        if (msg.sender != address(oracle)) revert EthNotAccepted();
+    }
 
     /// @inheritdoc IPitBook
     /// @dev Who and when. Anyone may record a close until `CLOSE_RECORD_WINDOW` after its instant, and
@@ -268,8 +223,9 @@ contract PitBook is IPitBook {
     function recordClose(bytes32 ticker, uint32 day, bytes calldata report) external payable {
         if (_entered) revert Reentrancy();
         _entered = true;
+        uint256 kept = address(this).balance - msg.value;
         Ticker storage tk = _tickers[ticker];
-        _promoteReseed(ticker, tk);
+        PitBookLogic.promote(_reseeds, ticker, tk);
         if (tk.varWad == 0) revert UnknownTicker();
         if (tk.clock == Clock.NYWeekdays && !NYTime.isWeekday(day)) revert NotTradingDay();
         uint64 closeAt = NYTime.closeTs(day);
@@ -277,11 +233,30 @@ contract PitBook is IPitBook {
         uint32 last = tk.lastCloseDay;
         bool fresh = block.timestamp <= closeAt + CLOSE_RECORD_WINDOW;
         if (msg.sender != owner && (!fresh || day < last)) revert CloseTooOld();
-        Close storage cl = _closes[ticker][day];
-        if (cl.trustless) revert CloseIsFinal();
+        uint256 price;
+        bool trustless;
+        {
+            Close storage cl = _closes[ticker][day];
+            if (cl.trustless) revert CloseIsFinal();
 
-        (uint256 price,, bool trustless) = oracle.verifyCloseAt{value: msg.value}(ticker, closeAt, report);
-        if (price == 0 || price > type(uint128).max) revert BadPrice();
+            (price,, trustless) = oracle.verifyCloseAt{value: msg.value}(ticker, closeAt, report);
+            if (price == 0 || price > type(uint128).max) revert BadPrice();
+            _writeClose(ticker, cl, price, trustless, closeAt);
+        }
+        _stepOnClose(ticker, tk, last, day, fresh);
+        emit CloseRecorded(ticker, day, price, trustless, tk.varWad);
+
+        _entered = false;
+        // only the caller's ETH that the oracle did not spend goes back
+        uint256 left = address(this).balance - kept;
+        if (left != 0) SafeTransferLib.safeTransferETH(msg.sender, left);
+    }
+
+    /// @dev Writes a verified close into `cl`. A replacement of a keeper close by a keeper print is refused
+    ///      after the dispute window, a second time, or within the oracle's bound of the close it replaces.
+    function _writeClose(bytes32 ticker, Close storage cl, uint256 price, bool trustless, uint64 closeAt)
+        private
+    {
         uint256 old = cl.price;
         if (old == 0 && block.timestamp > closeAt + MISSED_CLOSE) cl.late = true;
         if (old != 0 && !trustless) {
@@ -293,8 +268,13 @@ contract PitBook is IPitBook {
         }
         cl.price = uint128(price);
         cl.trustless = trustless;
-        cl.multiplier = oracle.multiplier(ticker);
+        // the multiplier of the first write: a replacement moves the price, never the corporate-action test
+        if (old == 0) cl.multiplier = oracle.multiplier(ticker);
+    }
 
+    /// @dev The variance step of a recorded close on `day` (see `recordClose`); `last` is the newest close
+    ///      day before it.
+    function _stepOnClose(bytes32 ticker, Ticker storage tk, uint32 last, uint32 day, bool fresh) private {
         if (day > last) {
             uint256 v = tk.varWad;
             bool stepped;
@@ -307,11 +287,6 @@ contract PitBook is IPitBook {
         } else if (day == last && tk.lastCloseStepped) {
             (tk.lastCloseStepped, tk.varWad) = _step(ticker, tk.clock, tk.prevCloseDay, day, tk.varBefore);
         }
-        emit CloseRecorded(ticker, day, price, trustless, tk.varWad);
-
-        _entered = false;
-        uint256 left = address(this).balance;
-        if (left != 0) SafeTransferLib.safeTransferETH(msg.sender, left);
     }
 
     /// @notice Disputes the keeper close a round was settled on. Only the guardian, only during that
@@ -326,31 +301,34 @@ contract PitBook is IPitBook {
     ///      reverts rather than record a dispute that would hold nothing.
     function dispute(bytes32 roundId) external {
         if (msg.sender != guardian()) revert OnlyGuardian();
-        IFallpitHook h = IFallpitHook(hook);
-        IFallpitHook.RoundConfig memory c = h.getConfig(roundId);
-        IFallpitHook.RoundState memory st = h.getState(roundId);
-        Close storage cl = _closes[c.ticker][c.day];
-        uint64 until = NYTime.closeTs(c.day) + DISPUTE_WINDOW;
-        if (
-            st.status != IFallpitHook.Status.Settled || st.settledTrustless || cl.trustless
-                || block.timestamp >= uint256(st.settledAt) + c.params.challengeWindow
-                || block.timestamp >= until
-        ) revert DisputeNotAllowed();
-        cl.disputeEnd = until;
-        emit CloseDisputed(c.ticker, c.day, roundId, until);
+        PitBookLogic.dispute(_closes, hook, roundId);
     }
 
     /// @inheritdoc IPitBook
     /// @dev Keyed by the print's own `ts`, not by the commit's instant t: one print prices every t in
     ///      `(prevTs, ts]`, so after a keeper gap many instants share one print, and they must share its one
-    ///      budget too. One slot that reset when ts changed could be bypassed by
-    ///      interleaving fills of two prints, so every print has its own slot.
+    ///      budget too. One slot per round: the router fills a round's commits in commit order, their
+    ///      instants never go back, and the print of an instant is the first at or after it, so a round's
+    ///      prints never go back either. A later print starts its own sum. A fill priced by an earlier print
+    ///      than the one stored (two keeper prints that cover the same instant) is charged to the stored sum
+    ///      and keeps the stored ts: it cannot reset the sum, and a valid fill is never refused for its
+    ///      order. Its budget is at most the stored print's (the depth scale never rises).
     function takeRisk(bytes32 roundId, uint64 ts, uint256 risk, uint256 budget) external returns (bool) {
         if (msg.sender != hook) revert OnlyHook();
-        uint256 used = riskUsed[roundId][ts] + risk;
+        RiskSum memory s = _riskSum[roundId];
+        if (ts < s.ts) ts = s.ts;
+        uint256 used = (ts == s.ts ? s.used : 0) + risk;
         if (used > budget) return false;
-        riskUsed[roundId][ts] = used;
+        // used <= budget <= capital * riskCapBps / 1e4, capital at most 1e33 wei (the engine's depth check at
+        // the open): far below 2^192
+        _riskSum[roundId] = RiskSum({ts: ts, used: uint192(used)});
         return true;
+    }
+
+    /// @inheritdoc IPitBook
+    function riskUsed(bytes32 roundId, uint64 ts) external view returns (uint256) {
+        RiskSum memory s = _riskSum[roundId];
+        return ts == s.ts ? s.used : 0;
     }
 
     /// @inheritdoc IPitBook
@@ -365,21 +343,10 @@ contract PitBook is IPitBook {
     {
         if (msg.sender != hook) revert OnlyHook();
         if (caller != volKeeper()) revert IFallpitHook.OnlyVolKeeper();
-        SigmaEffState memory cur = sigmaEffState[roundId];
-        if (block.timestamp < uint256(cur.at) + SIGMA_EFF_GAP) revert IFallpitHook.SigmaEffTooSoon();
-        uint256 inForce = cur.sigma == 0 ? sigma : cur.sigma;
-        uint256 rise = cur.rise == 0 ? WAD : cur.rise;
-        next = proposed.max(inForce * (BPS - SIGMA_STEP_BPS) / BPS)
-            .min(inForce * (BPS + SIGMA_STEP_BPS) / BPS)
-            .max(sigma * SIGMA_LO_BPS / BPS)
-            .min(sigma * SIGMA_HI_BPS / BPS);
-        if (next > inForce) {
-            // the highest the rise budget still allows; never below the sigma in force
-            next = next.min(inForce * SIGMA_RISE_CAP / rise).max(inForce);
-            rise = rise * next / inForce;
+        if (block.timestamp < uint256(sigmaEffState[roundId].at) + SIGMA_EFF_GAP) {
+            revert IFallpitHook.SigmaEffTooSoon();
         }
-        sigmaEffState[roundId] =
-            SigmaEffState({sigma: uint96(next), at: uint64(block.timestamp), rise: uint96(rise)});
+        return PitBookLogic.stepSigmaEff(sigmaEffState, roundId, sigma, proposed);
     }
 
     /// @notice The risk budget of one print second (WAD chips): `capital * riskCapBps * g / 1e4`, capital in
@@ -427,37 +394,17 @@ contract PitBook is IPitBook {
         uint8 windows,
         FillSource fillSource
     ) external onlyOwner {
-        if (uint256(weights.afterHours) + weights.gap + weights.preMarket + weights.regular == 0) {
-            weights = defaultWeights(clock);
-        }
-        if (clock == Clock.EveryDay) {
-            if (windows != 0) revert BadParams();
-            windows = PitClock.ALL_WINDOWS;
-        } else if (windows == 0) {
-            windows = PitClock.DEFAULT_WINDOWS;
-        }
-        if (
-            varWad < MIN_VAR || varWad > MAX_VAR
-                || uint256(weights.afterHours) + weights.gap + weights.preMarket + weights.regular != BPS
-                || weights.regular < (clock == Clock.EveryDay ? BPS : MIN_REGULAR_WEIGHT)
-                || windows > PitClock.ALL_WINDOWS || windows & PitClock.REGULAR == 0
-        ) {
-            revert BadParams();
-        }
-        if (!oracle.supported(ticker)) revert UnknownTicker();
-        Ticker storage tk = _tickers[ticker];
-        _promoteReseed(ticker, tk);
-        if (tk.varWad == 0) {
-            // a first registration (not a second call before the first is in force) joins the list
-            if (_reseeds[ticker].eta == 0) _tickerList.push(ticker);
-            tk.clock = clock;
-        } else if (clock != tk.clock) {
-            revert BadParams();
-        }
-        uint64 eta = uint64(block.timestamp) + OWNER_DELAY;
-        _reseeds[ticker] =
-            Reseed({varWad: varWad, weights: weights, windows: windows, fillSource: fillSource, eta: eta});
-        emit TickerRegistered(ticker, varWad, clock, weights, windows, fillSource, eta);
+        (weights, windows) = PitBookRules.tickerTerms(varWad, clock, weights, windows);
+        PitBookLogic.registerTicker(
+            _tickers,
+            _reseeds,
+            _tickerList,
+            oracle,
+            OWNER_DELAY,
+            ticker,
+            clock,
+            Reseed({varWad: varWad, weights: weights, windows: windows, fillSource: fillSource, eta: 0})
+        );
     }
 
     /// @notice Marks a day on which no round may open for `ticker` (or clears the mark). Only for a day
@@ -535,23 +482,7 @@ contract PitBook is IPitBook {
     ///      `minCapital`, so the smallest allowed round can still trade every product. The menu must be
     ///      well formed (`PitMath.validMenu`): 2 to 12 products, each a run of bands `lo <= hi <= 39`.
     function setDefaultParams(Params calldata p) external onlyOwner {
-        if (
-            p.alpha == 0 || p.alpha > MAX_ALPHA || p.baseFee < MIN_BASE_FEE || p.baseFee > MAX_BASE_FEE
-                || p.closeFee > MAX_CLOSE_FEE || p.closeFee < p.baseFee || p.vegaFee > MAX_VEGA_FEE
-                || p.feeRamp > MAX_FEE_RAMP || p.challengeWindow < MIN_CHALLENGE
-                || p.challengeWindow > MAX_CHALLENGE || p.fillDelay < MIN_FILL_DELAY
-                || p.fillDelay > MAX_FILL_DELAY || p.refundDelay < MIN_REFUND_DELAY
-                || p.refundDelay > MAX_REFUND_DELAY || p.protocolFeeBps > MAX_PROTOCOL_FEE_BPS
-                || p.maxFillBps == 0 || p.maxFillBps > BPS || p.minCapital == 0
-                || p.minCapital > MAX_MIN_CAPITAL || uint256(p.alpha) * p.minCapital < MIN_ALPHA_TIMES_CAPITAL
-                || p.minTrade < MIN_MIN_TRADE || p.minTrade > MAX_MIN_TRADE
-                || uint256(p.minCapital) * WAD * p.maxFillBps / BPS < p.minTrade
-                || p.riskCapBps < MIN_RISK_CAP_BPS || p.riskCapBps > MAX_RISK_CAP_BPS
-                || uint256(p.minCapital) * WAD * p.riskCapBps * G_FLOOR_TENTHS / (BPS * 10) < p.minTrade
-                || p.lossLimitBps < MIN_LOSS_LIMIT_BPS || p.lossLimitBps > BPS || p.fillFee > MAX_FILL_FEE
-                || p.floorCapBps > BPS || uint256(p.minCapital) * WAD * p.floorCapBps / BPS < p.minTrade
-                || p.minPriceWad > MAX_MIN_PRICE || !PitMath.validMenu(p.menu)
-        ) revert BadParams();
+        PitBookRules.checkParams(p);
         if (_pendingDefaultsEta != 0 && block.timestamp >= _pendingDefaultsEta) _defaults = _pendingDefaults;
         uint64 eta = uint64(block.timestamp) + OWNER_DELAY;
         _pendingDefaults = p;
@@ -598,34 +529,9 @@ contract PitBook is IPitBook {
         )
     {
         if (paused) revert OpeningPaused();
-        Ticker memory tk = getTicker(ticker);
-        if (tk.varWad == 0) revert UnknownTicker();
-        bool everyDay = tk.clock == Clock.EveryDay;
-        if ((!everyDay && !NYTime.isWeekday(day)) || skip[ticker][day]) revert NotTradingDay();
-        uint32 last = tk.lastCloseDay;
-        if (last >= day || day - last > MAX_CLOSE_AGE) revert NoRecentClose();
-        (bool ok, uint256 extra) = _span(ticker, tk.clock, last, day);
-        if (!ok) revert NotNextTradingDay();
-        uint256 n = 1 + extra;
-        Weights memory w = tk.weights;
-        if (!everyDay && extra != 0) {
-            w.afterHours = uint16(w.afterHours / n);
-            w.preMarket = uint16(w.preMarket / n);
-            w.regular = uint16(w.regular / n);
-            w.gap = uint16(BPS - w.afterHours - w.preMarket - w.regular);
-        }
-        clock = RoundClock({
-            kind: tk.clock,
-            skipAfterHours: !everyDay && skipAfterHours[ticker][day],
-            windows: tk.windows,
-            prevDay: last,
-            day: day,
-            afterHours: w.afterHours,
-            gap: w.gap,
-            preMarket: w.preMarket,
-            regular: w.regular
-        });
-        return (_closes[ticker][last].price, (tk.varWad * n).sqrtWad(), clock, tk.fillSource, defaultParams());
+        (s0, sigma, clock, fillSource) =
+            PitBookLogic.openTerms(_tickers, _reseeds, _closes, skip, skipAfterHours, ticker, day);
+        params = defaultParams();
     }
 
     /// @inheritdoc IPitBook
@@ -640,13 +546,18 @@ contract PitBook is IPitBook {
     /// @notice The weights a ticker registered with all-zero weights gets: 6% after-hours, 14% gap, 10%
     ///         pre-market and 70% regular session for `NYWeekdays`, one segment for `EveryDay`.
     function defaultWeights(Clock clock) public pure returns (Weights memory) {
-        return clock == Clock.EveryDay ? Weights(0, 0, 0, uint16(BPS)) : Weights(600, 1400, 1000, 7000);
+        return PitBookRules.defaultWeights(clock);
     }
 
     /// @inheritdoc IPitBook
     function closeOf(bytes32 ticker, uint32 day) external view returns (uint256 price, bool trustless) {
         Close storage cl = _closes[ticker][day];
         return (cl.price, cl.trustless);
+    }
+
+    /// @inheritdoc IPitBook
+    function closeMultiplier(bytes32 ticker, uint32 day) external view returns (uint256) {
+        return _closes[ticker][day].multiplier;
     }
 
     /// @inheritdoc IPitBook
@@ -680,16 +591,7 @@ contract PitBook is IPitBook {
     /// @notice Volatility state, clock and fill source of a ticker as they apply now (a scheduled reseed that
     ///         has come into force included; all zero when not registered).
     function getTicker(bytes32 ticker) public view returns (Ticker memory tk) {
-        tk = _tickers[ticker];
-        Reseed storage r = _reseeds[ticker];
-        if (r.eta != 0 && block.timestamp >= r.eta) {
-            tk.varWad = r.varWad;
-            tk.varBefore = r.varWad;
-            tk.weights = r.weights;
-            tk.windows = r.windows;
-            tk.fillSource = r.fillSource;
-            tk.lastCloseStepped = false;
-        }
+        return PitBookLogic.tickerOf(_tickers, _reseeds, ticker);
     }
 
     /// @notice The reseed of `ticker` that is scheduled and not in force yet, or its registration while it
@@ -708,19 +610,12 @@ contract PitBook is IPitBook {
     /// @notice Packs band runs into the `menu` word of `Params`: product i is the run `[lo[i], hi[i]]`.
     ///         Reverts unless the result is a menu `setDefaultParams` accepts.
     function packMenu(uint8[] calldata lo, uint8[] calldata hi) external pure returns (uint256 menu) {
-        if (lo.length != hi.length || lo.length > PitMath.MAX_PRODUCTS) revert BadParams();
-        menu = PitMath.pack(lo, hi);
-        if (!PitMath.validMenu(menu)) revert BadParams();
+        return PitBookRules.packMenu(lo, hi);
     }
 
     /// @notice The band runs of a menu word: product i is `[lo[i], hi[i]]`.
     function unpackMenu(uint256 menu) external pure returns (uint8[] memory lo, uint8[] memory hi) {
-        uint256 n = PitMath.count(menu);
-        lo = new uint8[](n);
-        hi = new uint8[](n);
-        for (uint256 i; i < n; ++i) {
-            (lo[i], hi[i]) = PitMath.run(menu, i);
-        }
+        return PitBookRules.unpackMenu(menu);
     }
 
     /// @notice The scheduled parameters that are not in force yet (`eta` zero when none).
@@ -728,39 +623,6 @@ contract PitBook is IPitBook {
         eta = _pendingDefaultsEta;
         if (eta == 0 || block.timestamp >= eta) return (p, 0);
         p = _pendingDefaults;
-    }
-
-    /// @dev Writes a reseed that has come into force into the ticker, before the ticker changes.
-    function _promoteReseed(bytes32 ticker, Ticker storage tk) private {
-        Reseed storage r = _reseeds[ticker];
-        if (r.eta == 0 || block.timestamp < r.eta) return;
-        tk.varWad = r.varWad;
-        tk.varBefore = r.varWad;
-        tk.weights = r.weights;
-        tk.windows = r.windows;
-        tk.fillSource = r.fillSource;
-        // the newest close's step was made on the variance the reseed replaced: nothing to redo
-        tk.lastCloseStepped = false;
-        delete _reseeds[ticker];
-    }
-
-    /// @dev Whether the round of `day` may start from the close of `last`, and how many days without a
-    ///      close it spans besides its own. Every day strictly between that would have had a round (a
-    ///      weekday for `NYWeekdays`, any day for `EveryDay`) must be skipped, or missed: its close not
-    ///      recorded `MISSED_CLOSE` after its instant (`last` is the newest close, so a day after it has
-    ///      none). Each such day counts in `extra`. At most `MAX_CLOSE_AGE` days.
-    function _span(bytes32 ticker, Clock clock, uint32 last, uint32 day)
-        private
-        view
-        returns (bool ok, uint256 extra)
-    {
-        if (day <= last || day - last > MAX_CLOSE_AGE) return (false, 0);
-        for (uint32 d = last + 1; d < day; ++d) {
-            if (clock == Clock.NYWeekdays && !NYTime.isWeekday(d)) continue;
-            if (!skip[ticker][d] && block.timestamp <= NYTime.closeTs(d) + MISSED_CLOSE) return (false, 0);
-            ++extra;
-        }
-        return (true, extra);
     }
 
     /// @dev The variance after the close of `day` that follows the close of `prev`: one EWMA step on the
@@ -773,24 +635,8 @@ contract PitBook is IPitBook {
     {
         Close storage a = _closes[ticker][prev];
         Close storage b = _closes[ticker][day];
-        (bool ok, uint256 extra) = _span(ticker, clock, prev, day);
+        (bool ok, uint256 extra) = PitBookLogic.span(skip, ticker, clock, prev, day);
         if (!ok || a.multiplier != b.multiplier) return (false, varWad);
-        return (true, _ewma(varWad, a.price, b.price, 1 + extra));
-    }
-
-    /// @dev EWMA of the daily variance with weight 0.94 on the past, clamped to [0.005^2, 0.15^2]. The new
-    ///      observation is the squared log return over `periods` trading days divided by `periods`, at most
-    ///      `MAX_STEP_IN_VARIANCES` times `varWad`.
-    function _ewma(uint256 varWad, uint256 previousClose, uint256 close, uint256 periods)
-        private
-        pure
-        returns (uint256)
-    {
-        int256 ret = FixedPointMathLib.lnWad(int256(close.divWad(previousClose)));
-        uint256 squared = uint256(ret * ret) / WAD / periods;
-        uint256 cap = MAX_STEP_IN_VARIANCES * varWad;
-        if (squared > cap) squared = cap;
-        uint256 next = (EWMA_KEEP * varWad + (100 - EWMA_KEEP) * squared) / 100;
-        return next < MIN_VAR ? MIN_VAR : (next > MAX_VAR ? MAX_VAR : next);
+        return (true, PitBookRules.ewma(varWad, a.price, b.price, 1 + extra));
     }
 }

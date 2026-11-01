@@ -46,6 +46,10 @@ swap ETH for chips on pools with no hooks (`commitWithEth`).
 | PitBook | `src/hook/PitBook.sol` | closes, variance, calendar and clock, default parameters, roles | yes (section 7.8) |
 | PitClock | `src/hook/PitClock.sol` | library: the clock of a round (rho and trading windows), in the book and the lens | none |
 | PitMath | `src/hook/PitMath.sol` | library: the menu, the worst band, the product cap, the post-fill check, fees; in the hook, the book and the lens | none |
+| RoundLogic | `src/hook/RoundLogic.sol` | linked library of the hook (runs on its storage): a round's open, settle, finalize, void, redeem's book side, live strikes | none |
+| PitBookLogic | `src/hook/PitBookLogic.sol` | linked library of the book (runs on its storage): a round's terms, ticker registration, disputes, the learned sigma's step | none |
+| PitBookRules | `src/hook/PitBookRules.sol` | linked library of the book, pure: the bounds of the owner's settings, the daily variance step | none |
+| SessionLogic | `src/router/SessionLogic.sol` | linked library of the router (runs on its storage): sessions, signed orders, vault actions, listings, their digests | none |
 | FallpitLens | `src/hook/FallpitLens.sol` | quotes, a round's whole menu in one call (with the `dead` flag of a product priced under the minimum), the all-in cost of a product at three sizes, solvency and loss limit views | none |
 | FallpitDirectory | `src/hook/FallpitDirectory.sol` | discovery for apps: the tickers (`PitBook.tickers()`) and houses (`PitVault.houseIds`) with their status, an LP's position, and `nextOpenableDay(ticker)` by the book's own `openTerms` | none |
 | PitLister, AnchorRegistry, LaunchRecordSource, VaultFeeForwarder | `src/listing/` | open listing: anyone lists a coin against the stock it launched on | lister and registry: yes |
@@ -53,7 +57,7 @@ swap ETH for chips on pools with no hooks (`commitWithEth`).
 
 ## 2. Units and conventions
 
-- Solidity 0.8.26, `via_ir`, cancun. Dependencies: Uniswap `v4-core` (v4.0.0), `solady`, `forge-std`.
+- Solidity 0.8.26, the legacy pipeline (no `via_ir`), cancun. Dependencies: Uniswap `v4-core` (v4.0.0), `solady`, `forge-std`.
 - No proxies, no upgradeability, no emergency withdrawal of user or LP funds. Custom errors, events on
   every state change, NatSpec on every external function.
 - WAD = 1e18 fixed point for all math. Chips and tickets share the chip's decimals `d` (require
@@ -91,8 +95,11 @@ C(v) = lambda + sum_j b_j * (p_j - pi_j)
 ```
 
 - Solve lambda on chain: safeguarded Newton in log space (`g(lambda) = ln sum exp(ln pi_j + (v_j - lambda)/b_j)`),
-  bisection fallback, at most 64 iterations, revert if `|sum p - 1| > 1e-12`. No caller-supplied hints.
-  Log-sum-exp so nothing overflows.
+  bisection fallback, at most 64 iterations, revert if `|sum p - 1| > 1e-12`. No caller-supplied hints:
+  the hook starts a fill's solves at the root its round's previous fill returned (`fillFrom`, stored with
+  the state, so nobody chooses it), and a start outside the bracket is replaced by the bracket's lower end.
+  The start changes the number of steps, not the root beyond the solve's tolerance. Log-sum-exp so nothing
+  overflows.
 - Every cost evaluation carries an error bound (`slack`); a buy is charged the computed difference plus the
   slacks, a sell is paid the difference minus them. On top a buy never costs less than `delta * pBefore` and
   a sell never pays more than `delta * pBefore`.
@@ -191,8 +198,12 @@ A ticker is `supported` when it has an enabled Pyth feed id, or an enabled aggre
 - `setSourceDisabled(ticker, source, bool)` switches a source off and on again. Off: the source verifies no
   fill at once (an emergency brake: a stopped fill is not final, the commit refunds when its window ends),
   does not count towards `supported`, and verifies no close whose instant is `SIGNER_DELAY` or more after
-  the switch (`closesOffFrom`), so the close of a round open at the switch is still verified. Back on: at
-  once. Nothing is re-pointed by it. No owner change can stop or pick an open round's close (hook
+  the switch (`closesOffFrom`), so the close of a round open at the switch is still verified. Back on:
+  fills at once; closes at once if no close instant was refused yet, else the instants from
+  `closesOffFrom` to `SIGNER_DELAY` after the switch back on stay refused (a close gap, `closeGap` and
+  `closeGaps`). A new gap merges with a live gap it overlaps or touches and is kept apart otherwise (up to
+  eight per source); a gap is dropped three days after its end. A stock token or a Pyth feed added to a
+  ticker later takes effect only from 04:00 to 15:30 New York (`clearOfCloses`). Nothing is re-pointed by it. No owner change can stop or pick an open round's close (hook
   DESIGN.md section 13).
 - The first signer set and threshold are constructor arguments and in force at once. `setSigners` and
   `setThreshold` only schedule a change: it takes effect `SIGNER_DELAY` later, replaces any
@@ -310,7 +321,7 @@ closes, earnings and corporate-action days), `skipAfterHours[day]` (the round of
 the after-hours before it). Global: default round parameters (the menu of products among them), owner,
 guardian (and the one named next, in force 24 hours after it was named), fee recipient, pause flag, the
 hook (`setHook`, once, by the deployer: `dispute` reads its rounds). Each close is kept with whether it is
-trustless, the stock token's multiplier when it was recorded, the end of a dispute of it, and whether a
+trustless, the stock token's multiplier when it was first recorded (a replacement keeps it), the end of a dispute of it, and whether a
 keeper print replaced it already (`closeInfo`). A ticker's registration, like a reseed, waits 24 hours
 (`pendingReseed`).
 
@@ -388,7 +399,8 @@ the contracts compute what this section says, to the unit.
 "either": with two sources two prints qualify for one instant and the filler could pick. A ticker
 whose Pyth feed the filler can read is `TrustlessOnly`; the others are `KeeperOnly`.
 
-**The menu.** A round has 2 to 12 **products**. Product `i` is a
+**The menu.** A round opens with 2 to 12 **products** and may add up to two live strikes of two products
+each during the day (7.3.2), so it has at most 15. Product `i` is a
 contiguous run of bands `[lo, hi]` (`0 <= lo <= hi <= 39`, both ends included) and one ticket id; a ticket
 pays one chip when the band of the close is inside the run. Runs may overlap, and a menu need not cover the ladder: a close in a band
 no product covers pays nobody, a close in a band two products share pays both. The menu is one of the
@@ -396,7 +408,9 @@ book's default parameters (`Params.menu`, one word: the lowest byte is the numbe
 `i` has `lo` in byte `1 + 2i` and `hi` in byte `2 + 2i`, zero above the last product;
 `PitBook.packMenu` and `unpackMenu` convert). It is the same for every ticker, is set by the owner like
 every other default (bounded, 24 hours ahead, 7.8) and is frozen in each round's config when the round
-opens. Nothing in the hook or the lens knows a particular menu.
+opens. Nothing in the hook or the lens knows a particular menu. A round's stored menu word grows when a
+strike opens (two more runs, up to 15: 8 + 15 x 16 = 248 bits), and its top byte (bits 248 to 255) then
+holds the number of products the round opened with (`PitMath.strikeFrom`; 0 while no strike is open).
 
 The default menu (`PitBook.DEFAULT_MENU`): eight floors that partition the 40 bands, then the pair.
 
@@ -437,7 +451,7 @@ Two protections come with the menu, both default parameters frozen per round:
 **Hook**, per round `(house, day)`: frozen config (ticker, house, chip, day, decimals, fill source, `openTs`
 (the time it opened), `closeTs`, `cutoff`, the clock, `S0`, `sigma`, capital `L`, `maxFill`, the parameter
 set with the menu), pricing state `v[40]` (packed, two bands a word) and its depth scale `g`, and per
-product (twelve slots, the ones above the menu stay zero) the supply and the cost basis (`premium`);
+product (fifteen slots, the ones above the menu stay zero) the supply and the cost basis (`premium`);
 chips `held`, protocol fees, status `Open -> Settled -> Final` or `Void`. Per house: the packed
 `openLnInv` of its latest round (section 3), so only the latest round of a house can trade.
 
@@ -450,10 +464,11 @@ Rounds are isolated: a round can never spend another round's chips, even in the 
 1. **`PitBook.recordClose(ticker, day, report)`**: `oracle.verifyCloseAt(ticker, closeTs(day), report)`
    (the print covering 16:00:00, up to `closeMaxLag` late) once that instant has passed, on a weekday for a
    `NYWeekdays` ticker and on any day for an `EveryDay` ticker (skipped days included: a day the book sits
-   out still has a close). Either source is accepted (for a keeper print the ticker needs an aggregator,
-   section 4). The ticker's registration must be in force.
-   - **Replacement.** A trustless print replaces a keeper close and is final; nothing replaces a trustless
-     one. A keeper print replaces a keeper close only while the guardian's dispute of it runs (step 5),
+   out still has a close). **One close source per ticker:** a ticker with a Pyth feed id closes on its
+   Pyth print only (`KeeperCloseRefused` for a keeper print), a ticker without one on a keeper print (it
+   needs an aggregator, section 4). So nobody can pick between two closes of one instant. The ticker's
+   registration must be in force.
+   - **Replacement.** Nothing replaces a trustless close. A keeper print replaces a keeper close only while the guardian's dispute of it runs (step 5),
      only once per close, and only when it differs from the recorded close by more than the oracle's
      `boundBps` for the ticker (`ReplacementRefused` otherwise). Two valid keeper prints for one instant
      exist only when signers equivocated; the rule keeps whoever holds the second one from moving the
@@ -508,9 +523,10 @@ Rounds are isolated: a round can never spend another round's chips, even in the 
    `msg.value` equal to the round's fill fee (below; `WrongFillFee` otherwise). A commit cannot be cancelled.
 
    **Fill fee (the trader pays for the fill).** A fill costs about 1.18M gas (1.53M for the first fill
-   of a round) and somebody has to send it. Every commit therefore carries the round's `fillFee` in the
-   chain's native coin (ETH): a frozen parameter of the round, default 0.0001 ETH, owner-bounded from 0 to
-   0.01 ETH; 0 switches it off. A sell commit carries it too.
+   of a round, about 0.61M (613,783) for each extra fill in a `fillBatch`) and somebody has to send it. Every commit
+   therefore carries the round's `fillFee` in the chain's native coin (ETH): a frozen parameter of the
+   round, default 0.000025 ETH (a fill on its own at 0.02 gwei), owner-bounded from 0 to 0.01 ETH; 0
+   switches it off. A sell commit carries it too.
    The router holds it with the commit and pays it out exactly once:
    - to **whoever calls `fill`** for that commit, when the fill ends in a trade and when it ends in a
      refund (a rejection by the hook, or the commit's own limit): the filler did the work both times, and a
@@ -571,22 +587,34 @@ Rounds are isolated: a round can never spend another round's chips, even in the 
    oracle is asked, so they refund with any report. Anything else (a report that is not the print for `t`,
    an oracle failure, `ChipShort`, out of gas) reverts the whole `fill` and leaves the commit pending, so
    a filler cannot force a refund. ETH
-   sent with `fill` is the filler's own: it pays the oracle's update fee and returns to the filler when the
-   fill ends in a refund (through the same payment as the fill fee, so it too is credited in `ethOwed` if the
-   filler does not take it). The fill fees the router holds are never used for the oracle.
+   sent with `fill` is the filler's own: it pays the oracle's update fee, and what is left returns to the
+   filler, both when the fill trades and when it ends in a refund (through the same payment as the fill
+   fee, so it too is credited in `ethOwed` if the filler does not take it). The fill fees the router holds
+   are never used for the oracle.
+
+   **Batches.** `fillBatch(commitIds, reports)` runs the commits in the order given, each as `fill` runs it
+   with no ETH: the same checks, the same `Filled`, `Refunded` and `FillFeePaid` events, the same fee and
+   refund. A commit that is not pending, not due, past its window, held by an earlier pending commit, or
+   whose fill fails with an error that is not a final rejection is skipped (`false`, the commit and its
+   escrow as they were) instead of reverting the batch. It sends no ETH, so it fills only with reports
+   that need no oracle fee. Later fills of a round in the same transaction read warm storage.
    The escrow is measured by balance difference and must equal what was sent (`BadEscrow` otherwise: no
    fee-on-transfer chips, section 6). Should a chip start to tax after the commit, the cost of a buy must
    fit in what reached the hook, or the commit refunds (`Limit`).
 4. **`settleRound(house, day)`** (anyone, once the close is recorded): the band of the close is
    `bandOf(ln(close / S0))`; a product wins when its run contains that band (`winners` is a bit mask over
    the product indices). Records the payout owed: the sum of the supplies of the winning products.
-   Status `Settled`. It can run again only when the recorded close changed (a trustless print replaced a
-   keeper print).
+   Status `Settled`. It can run again only when the recorded close changed (a keeper print replaced a
+   disputed keeper close). **Corporate actions:** when the close and the close the round started from were
+   recorded with different stock token multipliers (`PitBook.closeMultiplier`: a split or another
+   corporate action in between), `settleRound` reverts with `CorporateAction`, and `voidRound` voids the
+   round at once, open or settled (the house's next `openRound` does too): a split moves the price without
+   the market. A stock token added to a ticker later takes effect only from 04:00 to 15:30 New York
+   (`PitOracle.clearOfCloses`), so recording a close earlier or later cannot change its multiplier.
 5. **`finalizeRound(house, day)`** (anyone): immediately if the close is trustless, otherwise after
    `challengeWindow` (default 900 s, bounds 300 to 3600) from the first settlement and after the dispute
    of the close, if there is one. The window is short because the next round of the house opens only when
-   this one is final, and trades in the after-hours from then on. During the window anyone may replace
-   the close with a trustless print (step 1) and settle again, and the **guardian** may
+   this one is final, and trades in the after-hours from then on. During the window the **guardian** may
    `PitBook.dispute(roundId)`: every round on that close (every house of the ticker) then finalizes only
    from `DISPUTE_WINDOW` (one hour) after the close's instant, 17:00 New York, and until then the close
    may be replaced as step 1 says. A dispute must come before that instant (`DisputeNotAllowed` after it):
@@ -628,7 +656,9 @@ the user needs no popup per trade, moves no coins first, and needs no ETH.
   - `nonce` must equal `sessionNonce(user)`.
   - Each grant digest works once, so a revoked session cannot be revived with its old grant.
 - **Ending sessions:** `revokeSession(key)` ends one session; `bumpSessionNonce()` ends all of them. The
-  user calls either directly.
+  user calls either directly. A revoke also refuses every grant of that key signed at the current
+  `sessionNonce` (`StaleNonce`): a grant signed before the revoke cannot bring the key back. To grant the
+  same key again, the user bumps the nonce first.
 - **Order:** `Order(address user,bytes32 roundId,uint8 product,bool isBuy,uint256 shares,uint256 limit,uint64 deadline,uint256 nonce)`,
   signed by the key and submitted by anyone with `commitWithSig(order, key, signature)` and
   `msg.value = fillFee`. It is checked as follows:
@@ -648,6 +678,46 @@ the user needs no popup per trade, moves no coins first, and needs no ETH.
 - **`redeemFor(user, id)`:** redeems all of `user`'s tickets of `id` for them, and anyone may call it. The
   payout always goes to `user` (the hook pays the holder it is given and accepts the router on any
   holder's behalf), so a caller can only make a user collect what is theirs.
+
+### 7.3.2 Live strikes
+
+The pair splits at the previous close. As the close comes near, its honest odds go to 0 or 1 and a new buy
+of either side stops paying: the likely side costs more than one chip with the close fee, the other is
+under the minimum price. A live strike is a second pair on the round's grid, at the price.
+
+**`hook.openStrike(roundId, m, t, report)`**, anyone, payable (the caller's ETH pays the oracle's update
+fee; the hook's own ETH is never used for it):
+
+1. The round is open; `t` is at most now, and at most `min(refundDelay, 30)` seconds in the past
+   (`PitMath.STRIKE_MAX_LAG`; `FillExpired`), so a caller cannot pick the most extreme print of a long
+   refund window.
+2. `report` is the oracle's print for `t` of the round's fill source, checked as a fill's print is
+   (`oracle.verifyAt`, `WrongFillSource`, `BadPrice`).
+3. The round's clock trades at the print (`StrikeWindow`).
+4. `m` is the inner edge (0 to 38) nearest to `ln(price / S0)` on the round's frozen grid, edge `m` at
+   `(m - 19) * sigma / 4` (`PitMath.edge`); on a tie the lower edge (`StrikeEdge`).
+5. At most half of the round's variance is still ahead at the print: `rho <= 0.5` (`StrikeTooEarly`).
+6. `m` is at least two edges from 19 (the default pair's edge) and from the edge of every strike already
+   open (`StrikeTooClose`).
+7. Every pair is pinned: the print is at least `0.84 * sd` from edge 19 and from the edge of every open
+   strike, `sd = sigmaEff * sqrt(rho)` the remaining standard deviation at the print (`PitMath.context`,
+   the learned sigma) and 0.84 the 80/20 point of the normal law (`PitMath.STRIKE_PIN_Z`;
+   `StrikeNotPinned`). So the slots go to strikes that are needed: nobody can use them up while a pair
+   still trades near even odds.
+8. The round has room for two more products: at most 15 (`StrikeNoRoom`). The default menu has 10, so it
+   takes two strikes; a menu of 12 takes one.
+
+The strike appends LOWER-m on `[0, m]` (index n) and HIGHER-m on `[m + 1, 39]` (index n + 1) to the round's
+menu and emits `StrikeOpened`. Its products are products like the others: one ticket id each, priced from
+the same band state, with the same fees, the same per-fill cap and risk budget, in the pooled worst case
+and the loss limit, settled, voided and redeemed per product. The side narrower than half the ladder is a
+floor for the product cap (7.2). The lens marks strike products (`Product.strike`) and tells the edge a
+print would open and whether it may (`strikeEdgeAt(roundId, price, ts)`, rules 3 to 8; the instant's age
+of rule 1 is the caller's to keep).
+
+Gas (`test/integration/Gas.t.sol`, isolated): `openStrike` about 138k with a keeper-signed print and 116k
+with a Pyth update through the stand-in core contract; a later fill on a round with 14 products about 9k
+more than on 10 (under 1%), `settleRound` about 7k more.
 
 ### 7.4 Fees (all inside the hook)
 
@@ -795,7 +865,7 @@ should show the lens's `low` and `high`, rounded to a wei.
 
 `RoundOpened` (with the menu word), `Filled` (with the product index), `RoundSettled` (with the `uint16`
 mask of winners), `RoundFinalized`, `RoundVoided`, `Redeemed` (with the ticket id), `ProtocolFeesCollected`,
-`SigmaEffSet` and the ERC-6909 `Transfer`, `Approval` and `OperatorSet` of the tickets (hook);
+`SigmaEffSet`, `StrikeOpened(roundId, m, indexLow, indexHigh, price, ts)` and the ERC-6909 `Transfer`, `Approval` and `OperatorSet` of the tickets (hook);
 `Committed`, `Filled`, `Refunded`, `FillFeePaid(commitId, to, amount, sent)` (`sent` false when the
 amount went to `ethOwed`), `EthClaimed`, the session events, `BoughtWithEth` (router); `CloseRecorded`,
 `TickerRegistered`, `DefaultParamsSet`, `SkipSet`, `SkipAfterHoursSet` and the role events (book).
@@ -813,13 +883,21 @@ amount went to `ethOwed`), `EthClaimed`, the session events, `BoughtWithEth` (ro
 | CommunityTreasury owner | move a non-chip token out of an inbox | never the chip leg |
 | Router deployer, book deployer | `setHook` once each | frozen afterwards; the deploy renounces the router's deployer right after `setHook` |
 | PitBook owner, on the router | `setEthPool(chip, ...)`: the hookless ETH/chip pool of `commitWithEth` | only pools with no hooks; the app quotes the pool it swaps on |
+| AnchorRegistry owner | name a ticker for an anchor (`nameTicker`); set or clear a coin's anchor by hand (`setManual`, beats every source); trust or stop trusting an anchor source (`addSource`, `removeSource`, at most 8) | immediate; reaches only listings made after it; holds no funds; existing houses are not touched |
+| PitLister owner | create a house by hand with no anchor check and no seed (`createHouse`); set the minimum seed (`setMinSeedUsd`, $50 to $5,000) and the seed lock (`setLockTime`, 1 to 30 days) | immediate; reaches only later listings; never moves a seed or LP funds |
 | Hook, vault, router, math, lens | no owner | |
+
+PitBook has a two-step ownership transfer. The other five owners (PitOracle, ChipGuard, CommunityTreasury,
+AnchorRegistry, PitLister) use solady `Ownable`: `transferOwnership` is one step and takes effect at once; only
+the handover (`requestOwnershipHandover`, then `completeOwnershipHandover` by the owner) is two-step.
 
 No role can change an open round's config, and no role can move user, LP or endowment funds. The one input to
 an open round is the vol keeper's learned sigma (`setSigmaEff`, section 10), inside the hook's clamps. Parameter
 bounds enforced by the book: `0 < alpha <= 0.79`, `0.5% <= baseFee <= 10%`, `baseFee <= closeFee <= 20%`,
 `vegaFee <= 1`, `feeRamp <= 6.5 h`, `300 s <= challengeWindow <= 3600 s`, `2 <= fillDelay <= 60`,
 `10 <= refundDelay <= 120`, `protocolFeeBps <= 5000`, `0 < maxFillBps <= 10000`,
+`10 <= riskCapBps <= 10000` and `minCapital * riskCapBps * 0.3 / 1e4 >= minTrade` (so the smallest risk
+budget can still trade),
 `0 < minCapital <= 1e15`, `alpha * minCapital >= 1e15` (so `openDepths` accepts every round that passes
 `minCapital`), `1e12 <= minTrade <= 1000e18`, `minCapital * maxFillBps / 1e4 >= minTrade` (so the smallest
 round can still trade), `1000 <= lossLimitBps <= 10000`, `fillFee <= 0.01 ETH`, `floorCapBps <= 10000`
@@ -833,8 +911,8 @@ default 13; `EveryDay` takes zero only.
 
 Defaults: `alpha 0.2`,
 `baseFee 2%`, `closeFee 5%`, `vegaFee 0.1`, `feeRamp 120 min`, `challengeWindow 900`, `fillDelay 2`,
-`refundDelay 30`, `protocolFeeBps 1000`, `maxFillBps 200`, `minCapital 1000`, `minTrade 1e18`,
-`lossLimitBps 3000`, `fillFee 0.0001 ETH`, `floorCapBps 10000` (no product cap), `minPriceWad 0.02`, and
+`refundDelay 30`, `protocolFeeBps 1000`, `maxFillBps 2000`, `riskCapBps 300`, `minCapital 1000`,
+`minTrade 1e18`, `lossLimitBps 3000`, `fillFee 0.000025 ETH`, `floorCapBps 10000` (no product cap), `minPriceWad 0.02`, and
 the menu of 7.2. `minCapital`
 stays 1000: `alpha * minCapital` is 2e20 against the bound of 1e15, and the smallest round opens
 (`test/integration/MinCapital.t.sol`).
@@ -939,7 +1017,8 @@ commit already closed, inside that lock, and never revert (7.3); `claimEth` is l
   shape.
 
 `script/DeployTestnet.s.sol` deploys and wires everything for 46630 (`run()`, then `createHouses()` and
-`setUpListing()`); `script/DeployMainnet.s.sol` does mainnet 4663 in one run. `README.md` has both.
+`setUpListing()`); `script/DeployMainnet.s.sol` deploys mainnet 4663 (`run()`, then `createHouses()` 24 hours later);
+`script/CheckDeployment.s.sol` checks it read-only. `README.md` has both.
 
 ## 10. Vol learning and the vol-mix prior
 

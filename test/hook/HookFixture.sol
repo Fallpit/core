@@ -41,7 +41,7 @@ abstract contract HookFixture is Test, StandardMenu {
     uint256 internal constant SEED_VAR = 0.0004e18; // sigma = 2%
     uint256 internal constant HOUSE_CAPITAL = 1_000_000e18;
     /// @dev The book's default fill fee: what every commit carries unless a test sets other parameters.
-    uint256 internal constant FILL_FEE = 0.0001 ether;
+    uint256 internal constant FILL_FEE = 0.000025 ether;
 
     PoolManager internal pm;
     FallpitRouter internal router;
@@ -199,7 +199,7 @@ abstract contract HookFixture is Test, StandardMenu {
     }
 
     /// @dev The tickets of a round (id zero above its menu).
-    function _tickets(bytes32 roundId_) internal view returns (Ticket[12] memory) {
+    function _tickets(bytes32 roundId_) internal view returns (Ticket[15] memory) {
         return ticketsOf(hook, roundId_);
     }
 
@@ -286,8 +286,8 @@ abstract contract HookFixture is Test, StandardMenu {
     }
 
     function _assertSupplies() internal view {
-        (uint256[12] memory supply,) = hook.getSupplies(roundId);
-        Ticket[12] memory tokens = _tickets(roundId);
+        (uint256[15] memory supply,) = hook.getSupplies(roundId);
+        Ticket[15] memory tokens = _tickets(roundId);
         uint256 n = PitMath.count(hook.getConfig(roundId).params.menu);
         for (uint256 i; i < MAX_PRODUCTS; ++i) {
             if (i < n) {

@@ -89,27 +89,34 @@ contract ExtendedHoursTest is IntegrationFixture {
     // --------------------------------------------------------------------------------------------
 
     function test_stockRound_tradedInAfterHoursPreMarketAndRegularSession() public {
+        _useKeeperClosedTicker();
         uint256 minted = 3 * STAKE + HOUSE_CAPITAL;
         // Monday 16:01 New York: Monday's close is on the books and the house is free. Tuesday's round opens.
         assertEq(clock, prevClose + 60);
-        bytes32 tuesday = hook.openRound(NVDA, address(chip), day);
+        bytes32 tuesday = hook.openRound(ticker, address(chip), day);
         roundId = tuesday;
-        IFallpitHook.RoundConfig memory c = hook.getConfig(roundId);
-        assertEq(c.openTs, prevClose + 60, "open from the moment it was opened");
-        assertEq(c.closeTs, NYTime.closeTs(day));
-        assertEq(c.clock.prevDay, day0);
-        PitClock.Times memory w = lens.windows(roundId);
-        assertEq(w.prevClose, prevClose);
-        assertEq(w.afterHoursEnd, afterHoursEnd);
-        assertEq(w.preMarketStart, preMarketStart);
-        assertEq(w.regularStart, regularStart);
-        assertEq(w.cutoff, cutoff);
+        {
+            IFallpitHook.RoundConfig memory c = hook.getConfig(roundId);
+            assertEq(c.openTs, prevClose + 60, "open from the moment it was opened");
+            assertEq(c.closeTs, NYTime.closeTs(day));
+            assertEq(c.clock.prevDay, day0);
+            PitClock.Times memory w = lens.windows(roundId);
+            assertEq(w.prevClose, prevClose);
+            assertEq(w.afterHoursEnd, afterHoursEnd);
+            assertEq(w.preMarketStart, preMarketStart);
+            assertEq(w.regularStart, regularStart);
+            assertEq(w.cutoff, cutoff);
+        }
         assertTrue(vault.isLocked(house), "the house is in the round from now to Tuesday's close");
 
         // ---- Monday's after-hours
         uint256 aliceCost = _buyAt(prevClose + 5 minutes, alice, HIGHER, 10_000e18, S0 * 1002 / 1000);
-        (uint256 rho,) = lens.clockAt(roundId, clock);
-        assertEq(rho, 1e18 - uint256(0.06e18) * 300 / 14_400, "five minutes of the after-hours' 6% are gone");
+        {
+            (uint256 rho,) = lens.clockAt(roundId, clock);
+            assertEq(
+                rho, 1e18 - uint256(0.06e18) * 300 / 14_400, "five minutes of the after-hours' 6% are gone"
+            );
+        }
         _buyAt(prevClose + 2 hours, bob, LOWER, 8_000e18, S0 * 998 / 1000);
         assertEq(_state().g, uint256(0.97e18).sqrtWad());
         // the last second of the after-hours trades; the commit for it is made at 19:59:57
@@ -119,19 +126,23 @@ contract ExtendedHoursTest is IntegrationFixture {
         _expectNoCommit(alice);
         _warp(afterHoursEnd + 4 hours);
         _expectNoCommit(alice);
-        (uint256 nightQuote,,,,, RefundReason rejection) =
-            lens.quote(roundId, HIGHER, true, 1_000e18, S0, afterHoursEnd + 4 hours);
-        assertEq(uint8(rejection), uint8(RefundReason.Window));
-        assertGt(nightQuote, 0, "a price is still quoted");
+        {
+            (uint256 nightQuote,,,,, RefundReason rejection) =
+                lens.quote(roundId, HIGHER, true, 1_000e18, S0, afterHoursEnd + 4 hours);
+            assertEq(uint8(rejection), uint8(RefundReason.Window));
+            assertGt(nightQuote, 0, "a price is still quoted");
+        }
 
         // ---- Tuesday's pre-market: the overnight gap's 14% reaches the book at the first fill
         _buyAt(preMarketStart, bob, LOWER, 2_000e18, S0 * 1006 / 1000);
         assertEq(_state().g, uint256(0.8e18).sqrtWad(), "80% of the variance is left at 04:00");
-        uint256 before = chip.balanceOf(alice);
-        _warp(preMarketStart + 2 hours);
-        uint256 proceeds = _sell(alice, HIGHER, 4_000e18, S0 * 1007 / 1000);
-        assertEq(chip.balanceOf(alice), before + proceeds);
-        assertGt(proceeds, 0);
+        {
+            uint256 before = chip.balanceOf(alice);
+            _warp(preMarketStart + 2 hours);
+            uint256 proceeds = _sell(alice, HIGHER, 4_000e18, S0 * 1007 / 1000);
+            assertEq(chip.balanceOf(alice), before + proceeds);
+            assertGt(proceeds, 0);
+        }
 
         // ---- the regular session, without a break after the pre-market
         _buyAt(regularStart - 60, carol, F4, 2_000e18, S0 * 1005 / 1000);
@@ -157,14 +168,14 @@ contract ExtendedHoursTest is IntegrationFixture {
         vm.expectRevert(IFallpitHook.ChallengeWindowOpen.selector);
         hook.finalizeRound(house, day);
         vm.expectRevert(IFallpitHook.PreviousRoundActive.selector);
-        hook.openRound(NVDA, address(chip), day + 1);
+        hook.openRound(ticker, address(chip), day + 1);
         _warp(settled.settledAt + 900);
         hook.finalizeRound(house, day);
 
         // ---- and Wednesday's round opens at once, in Tuesday's after-hours, and trades
         day += 1;
         _setTimes(day - 1, day);
-        bytes32 wednesday = hook.openRound(NVDA, address(chip), day);
+        bytes32 wednesday = hook.openRound(ticker, address(chip), day);
         roundId = wednesday;
         assertEq(hook.getConfig(wednesday).s0, close, "Wednesday starts from Tuesday's close");
         assertEq(hook.getConfig(wednesday).openTs, clock);
@@ -172,7 +183,7 @@ contract ExtendedHoursTest is IntegrationFixture {
         uint256 wednesdayCost = _buyAt(clock + 60, alice, LOWER, 2_000e18, close);
 
         // Tuesday's winners redeem while Wednesday trades
-        Ticket[12] memory tokens = ticketsOf(hook, tuesday);
+        Ticket[15] memory tokens = ticketsOf(hook, tuesday);
         vm.prank(alice);
         assertEq(router.redeem(tokens[HIGHER].id, 6_000e18), 6_000e18);
         vm.prank(alice);

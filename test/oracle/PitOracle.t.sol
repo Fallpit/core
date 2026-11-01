@@ -9,6 +9,7 @@ import {OracleTestBase} from "./OracleTestBase.sol";
 import {MockPyth} from "./mocks/MockPyth.sol";
 import {MockChainlinkFeed} from "./mocks/MockChainlinkFeed.sol";
 import {MockStockToken} from "./mocks/MockStockToken.sol";
+import {NYTime} from "../../src/lib/NYTime.sol";
 
 /// @dev Calls the oracle with value and cannot receive the refund.
 contract RefundRejecter {
@@ -1047,7 +1048,9 @@ contract PitOracleTest is OracleTestBase {
         vm.expectRevert(PitOracle.SourcePinned.selector);
         oracle.setTicker(PYTH_ONLY, _cfg(TSLA_ID, address(feed), address(token)));
         oracle.setTicker(KEEPER_ONLY, _cfg(TSLA_ID, address(feed), address(token)));
-        vm.warp(NOW + 48 hours);
+        // a Pyth feed added later is in force after the delay, outside the close hours
+        (, uint64 activeFrom) = oracle.pendingConfig(KEEPER_ONLY);
+        vm.warp(activeFrom);
         vm.expectRevert(PitOracle.SourcePinned.selector);
         oracle.setTicker(KEEPER_ONLY, _cfg(OTHER_ID, address(feed), address(token)));
 
@@ -1055,7 +1058,7 @@ contract PitOracleTest is OracleTestBase {
         PitOracle.TickerConfig memory c = _cfg(TSLA_ID, address(feed), address(token));
         c.boundBps = 50;
         oracle.setTicker(TSLA, c);
-        vm.warp(NOW + 72 hours);
+        vm.warp(activeFrom + 24 hours);
         assertEq(oracle.config(TSLA).boundBps, 50);
         vm.stopPrank();
     }
@@ -1171,7 +1174,14 @@ contract PitOracleTest is OracleTestBase {
         oracle.setTicker(KEEPER_ONLY, _cfg(TSLA_ID, address(feed), address(token)));
         vm.expectRevert(abi.encodeWithSelector(PitOracle.SourceNotConfigured.selector, KEEPER_ONLY, uint8(1)));
         oracle.verifyCloseAt(KEEPER_ONLY, T, pythReport);
+        // a Pyth feed added later waits the delay and then for the hours with no close to record (04:00)
+        (, uint64 activeFrom) = oracle.pendingConfig(KEEPER_ONLY);
+        assertEq(activeFrom, oracle.clearOfCloses(NOW + 24 hours));
+        assertGt(activeFrom, NOW + 24 hours, "24 hours after a close instant is in the close hours");
         vm.warp(NOW + 24 hours);
+        vm.expectRevert(abi.encodeWithSelector(PitOracle.SourceNotConfigured.selector, KEEPER_ONLY, uint8(1)));
+        oracle.verifyCloseAt(KEEPER_ONLY, T, pythReport);
+        vm.warp(activeFrom);
         (uint256 price,, bool trustless) = oracle.verifyCloseAt(KEEPER_ONLY, T, pythReport);
         assertGt(price, 0);
         assertTrue(trustless);
@@ -1231,18 +1241,228 @@ contract PitOracleTest is OracleTestBase {
         vm.expectRevert(abi.encodeWithSelector(PitOracle.SourceIsDisabled.selector, TSLA, uint8(1)));
         oracle.verifyCloseAt(TSLA, from, atFrom);
 
-        // switching off again keeps the first instant; back on works at once
+        // switching off again keeps the first instant; back on: fills at once, but the closes from `from`
+        // to SIGNER_DELAY after the switch back on stay refused (their results may be known by now)
         vm.prank(owner);
         oracle.setSourceDisabled(TSLA, 1, true);
         assertEq(oracle.closesOffFrom(TSLA, 1), from);
+        uint64 gapTo = uint64(block.timestamp) + 24 hours;
         vm.prank(owner);
+        vm.expectEmit(true, true, false, true);
+        emit PitOracle.CloseGapSet(TSLA, 1, from, gapTo);
         vm.expectEmit(true, true, false, true);
         emit PitOracle.SourceDisabledSet(TSLA, 1, false, 0);
         oracle.setSourceDisabled(TSLA, 1, false);
         assertFalse(oracle.sourceDisabled(TSLA, 1));
         assertEq(oracle.closesOffFrom(TSLA, 1), 0);
+        (uint64 gFrom, uint64 gTo) = oracle.closeGap(TSLA, 1);
+        assertEq(gFrom, from);
+        assertEq(gTo, gapTo);
+        vm.expectRevert(abi.encodeWithSelector(PitOracle.SourceIsDisabled.selector, TSLA, uint8(1)));
         oracle.verifyCloseAt(TSLA, from, atFrom);
+        oracle.verifyCloseAt(TSLA, from - 1, _blob(37065425, 6125, -5, from - 1, from - 2));
         oracle.verifyAt(TSLA, T, pythAtT);
+        vm.warp(gapTo);
+        oracle.verifyCloseAt(TSLA, gapTo, _blob(37065425, 6125, -5, gapTo, gapTo - 1));
+    }
+
+    /// @dev The attack the gap stops: both sources off before a Monday close, the result seen, and the
+    ///      sources switched back on only when the house wins. The close stays refused, so the round voids
+    ///      either way. A second off and on merges its gap with the first: Monday stays refused, and the
+    ///      switch is never blocked.
+    function test_setSourceDisabled_backOnCannotReachAKnownClose() public {
+        uint64 monday = NOW + 2 days;
+        vm.startPrank(owner);
+        oracle.setSourceDisabled(TSLA, 1, true);
+        oracle.setSourceDisabled(TSLA, 2, true);
+        vm.stopPrank();
+        vm.warp(monday + 10 minutes);
+        vm.startPrank(owner);
+        oracle.setSourceDisabled(TSLA, 1, false);
+        oracle.setSourceDisabled(TSLA, 2, false);
+        vm.stopPrank();
+        bytes memory atMonday = _blob(37065425, 6125, -5, monday, monday - 1);
+        vm.expectRevert(abi.encodeWithSelector(PitOracle.SourceIsDisabled.selector, TSLA, uint8(1)));
+        oracle.verifyCloseAt(TSLA, monday, atMonday);
+        (uint64 gFrom, uint64 gTo) = oracle.closeGap(TSLA, 1);
+        // off and on again: the new gap merges with the first, so Monday stays refused
+        vm.prank(owner);
+        oracle.setSourceDisabled(TSLA, 1, true);
+        vm.warp(gTo + 1 days);
+        vm.prank(owner);
+        oracle.setSourceDisabled(TSLA, 1, false);
+        (uint64 mFrom, uint64 mTo) = oracle.closeGap(TSLA, 1);
+        assertEq(mFrom, gFrom, "the earliest start stays");
+        assertGt(mTo, gTo, "the latest end");
+        vm.expectRevert(abi.encodeWithSelector(PitOracle.SourceIsDisabled.selector, TSLA, uint8(1)));
+        oracle.verifyCloseAt(TSLA, monday, atMonday);
+    }
+
+    /// @dev Gaps that do not touch stay apart. The review case: an old gap, then a switch off much later, a
+    ///      close in the hours before that switch's first refused instant left unrecorded, and the switch back
+    ///      on. A merge of the two would cover that close, which was never refused, so the owner could void
+    ///      its round once the result is known. Apart, the close still verifies, the old gap still refuses its
+    ///      own closes, and the old gap is dropped `GAP_LIFE` (3 days) after its end.
+    function test_setSourceDisabled_separateGapsNeverCoverOnTime() public {
+        (uint64 a, uint64 b) = _cycle(TSLA, 1 hours);
+        vm.warp(b + 1 days);
+        (uint64 f2, uint64 e2) = _cycle(TSLA, 0);
+        _checkSeparate(a, b, f2, e2);
+
+        // 3 days after its end the old gap is dropped: no close inside it can settle a round any more
+        vm.warp(b + 3 days);
+        (uint64[8] memory from, uint64[8] memory to) = oracle.closeGaps(TSLA, 1);
+        assertEq(to[0], 0, "dropped");
+        assertEq(to[1], e2, "the newer gap lives on");
+        oracle.verifyCloseAt(TSLA, a, _at(a));
+        // a later gap takes the free slot
+        (uint64 f3,) = _cycle(TSLA, 2 hours);
+        (from, to) = oracle.closeGaps(TSLA, 1);
+        assertEq(from[0], f3, "the free slot is reused");
+        assertEq(to[1], e2);
+    }
+
+    /// @dev Switches the Pyth source of `ticker` off, waits to `wait` after its first refused instant and
+    ///      switches it back on. Returns the gap that leaves.
+    function _cycle(bytes32 ticker, uint64 wait) internal returns (uint64 from, uint64 to) {
+        vm.prank(owner);
+        oracle.setSourceDisabled(ticker, 1, true);
+        from = oracle.closesOffFrom(ticker, 1);
+        vm.warp(from + wait);
+        vm.prank(owner);
+        oracle.setSourceDisabled(ticker, 1, false);
+        to = from + wait + 24 hours;
+    }
+
+    /// @dev A Pyth close report for instant `t`.
+    function _at(uint64 t) internal view returns (bytes memory) {
+        return _blob(37065425, 6125, -5, t, t - 1);
+    }
+
+    function _checkSeparate(uint64 a, uint64 b, uint64 f2, uint64 e2) internal {
+        (uint64[8] memory from, uint64[8] memory to) = oracle.closeGaps(TSLA, 1);
+        assertEq(from[0], a, "the old gap is kept as it was");
+        assertEq(to[0], b);
+        assertEq(from[1], f2, "the new gap starts at its own first refused instant");
+        assertEq(to[1], e2);
+        (uint64 lf, uint64 lt) = oracle.closeGap(TSLA, 1);
+        assertEq(lf, f2, "closeGap shows the latest gap");
+        assertEq(lt, e2);
+        // the close in the hours before the second switch's first refused instant was never refused
+        uint64 c = f2 - 6 hours;
+        oracle.verifyCloseAt(TSLA, c, _at(c));
+        bytes memory r1 = _at(a);
+        vm.expectRevert(abi.encodeWithSelector(PitOracle.SourceIsDisabled.selector, TSLA, uint8(1)));
+        oracle.verifyCloseAt(TSLA, a, r1);
+        bytes memory r2 = _at(f2);
+        vm.expectRevert(abi.encodeWithSelector(PitOracle.SourceIsDisabled.selector, TSLA, uint8(1)));
+        oracle.verifyCloseAt(TSLA, f2, r2);
+    }
+
+    /// @dev A switch off right after a switch back on refuses closes from the end of the first gap: the new
+    ///      gap touches the first and merges with it, so one gap covers both and nothing between them is free.
+    function test_setSourceDisabled_touchingGapsMerge() public {
+        vm.prank(owner);
+        oracle.setSourceDisabled(TSLA, 1, true);
+        uint64 f1 = oracle.closesOffFrom(TSLA, 1);
+        vm.warp(f1 + 1 hours);
+        vm.startPrank(owner);
+        oracle.setSourceDisabled(TSLA, 1, false);
+        (, uint64 b) = oracle.closeGap(TSLA, 1);
+        oracle.setSourceDisabled(TSLA, 1, true);
+        assertEq(oracle.closesOffFrom(TSLA, 1), b, "the next first refused instant is the gap's end");
+        vm.warp(b + 5 hours);
+        oracle.setSourceDisabled(TSLA, 1, false);
+        vm.stopPrank();
+        (uint64[8] memory from, uint64[8] memory to) = oracle.closeGaps(TSLA, 1);
+        uint256 live;
+        for (uint256 i; i < 8; ++i) {
+            if (to[i] != 0) {
+                ++live;
+                assertEq(from[i], f1, "one gap from the first refused instant");
+                assertEq(to[i], b + 5 hours + 24 hours, "to the end of the second");
+            }
+        }
+        assertEq(live, 1);
+        bytes memory r3 = _at(b);
+        vm.expectRevert(abi.encodeWithSelector(PitOracle.SourceIsDisabled.selector, TSLA, uint8(1)));
+        oracle.verifyCloseAt(TSLA, b, r3);
+    }
+
+    /// @dev A Pyth feed added to a ticker later changes which source may record its close, so it waits for
+    ///      the hours with no close to record, like a stock token: scheduled for 16:02, it waits to 04:00.
+    function test_setTicker_aPythFeedWaitsUntilOutsideTheCloseHours() public {
+        uint32 d = 20_735;
+        vm.warp(NYTime.at(d, 16 hours + 2 minutes) - 24 hours);
+        vm.prank(owner);
+        oracle.setTicker(KEEPER_ONLY, _cfg(TSLA_ID, address(feed), address(token)));
+        (, uint64 activeFrom) = oracle.pendingConfig(KEEPER_ONLY);
+        assertEq(activeFrom, NYTime.at(d + 1, 4 hours), "the next 04:00 New York");
+    }
+
+    /// @dev A stock token added to a ticker later takes effect only from 04:00 to 15:30 New York: scheduled
+    ///      so that it would land at 16:02, it waits to 04:00 the next day. A close recorded at 16:01 and one
+    ///      recorded at 03:59 then read the same multiplier, so whoever records cannot pick it.
+    function test_setTicker_aStockTokenWaitsUntilOutsideTheCloseHours() public {
+        uint32 d = 20_735;
+        vm.warp(NYTime.at(d, 16 hours + 2 minutes) - 24 hours);
+        MockStockToken split = new MockStockToken(2e18);
+        vm.prank(owner);
+        oracle.setTicker(PYTH_ONLY, _cfg(TSLA_ID, address(feed), address(split)));
+        (, uint64 activeFrom) = oracle.pendingConfig(PYTH_ONLY);
+        assertEq(activeFrom, NYTime.at(d + 1, 4 hours), "the next 04:00 New York");
+        vm.warp(NYTime.at(d, 16 hours + 1 minutes));
+        uint256 early = oracle.multiplier(PYTH_ONLY);
+        vm.warp(NYTime.at(d + 1, 4 hours) - 1);
+        assertEq(oracle.multiplier(PYTH_ONLY), early, "recorded before or after: the same multiplier");
+        vm.warp(NYTime.at(d + 1, 4 hours));
+        assertEq(oracle.multiplier(PYTH_ONLY), 2e18, "in force from 04:00");
+    }
+
+    /// @dev `clearOfCloses` keeps a time inside 04:00 to 15:30 New York and moves any other to the next 04:00.
+    function test_clearOfCloses() public view {
+        uint32 d = 20_735;
+        assertEq(oracle.clearOfCloses(NYTime.at(d, 10 hours)), NYTime.at(d, 10 hours));
+        assertEq(oracle.clearOfCloses(NYTime.at(d, 3 hours)), NYTime.at(d, 4 hours));
+        assertEq(oracle.clearOfCloses(NYTime.at(d, 15 hours + 30 minutes)), NYTime.at(d + 1, 4 hours));
+        assertEq(oracle.clearOfCloses(NYTime.at(d, 23 hours)), NYTime.at(d + 1, 4 hours));
+        // a change that leaves the stock token as it is keeps the plain delay
+        assertEq(oracle.clearOfCloses(NYTime.at(d, 4 hours)), NYTime.at(d, 4 hours));
+    }
+
+    /// @dev On a testnet (no delay) switching a source back on leaves no gap, so the owner can still fill in
+    ///      older closes.
+    function test_setSourceDisabled_noGapOnATestnet() public {
+        PitOracle t0 = new PitOracle(pyth, owner, signerAddrs, 2, 0);
+        vm.startPrank(owner);
+        t0.setTicker(PYTH_ONLY, _cfg(TSLA_ID, address(0), address(0)));
+        t0.setSourceDisabled(PYTH_ONLY, 1, true);
+        vm.warp(NOW + 3 days);
+        t0.setSourceDisabled(PYTH_ONLY, 1, false);
+        vm.stopPrank();
+        (uint64 from, uint64 to) = t0.closeGap(PYTH_ONLY, 1);
+        assertEq(from, 0);
+        assertEq(to, 0);
+        (uint256 price,,) = t0.verifyCloseAt(PYTH_ONLY, T, _blob(37065425, 6125, -5, T, T - 1));
+        assertGt(price, 0, "an older close still verifies");
+    }
+
+    /// @dev The brake alone stops fills at once and leaves closes as they are.
+    function test_setFillsPaused_onlyFills() public {
+        bytes memory pythAtT = _blob(37065425, 6125, -5, T, T - 1);
+        vm.prank(owner);
+        oracle.setFillsPaused(TSLA, 1, true);
+        assertTrue(oracle.sourceDisabled(TSLA, 1));
+        assertEq(oracle.closesOffFrom(TSLA, 1), 0);
+        vm.expectRevert(abi.encodeWithSelector(PitOracle.SourceIsDisabled.selector, TSLA, uint8(1)));
+        oracle.verifyAt(TSLA, T, pythAtT);
+        oracle.verifyCloseAt(TSLA, T, pythAtT);
+        vm.prank(owner);
+        oracle.setFillsPaused(TSLA, 1, false);
+        oracle.verifyAt(TSLA, T, pythAtT);
+        vm.prank(address(0xbad));
+        vm.expectRevert();
+        oracle.setFillsPaused(TSLA, 1, true);
     }
 
     /// @dev On a testnet (no delay) a source switched off refuses every close at once.

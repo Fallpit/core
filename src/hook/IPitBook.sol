@@ -205,6 +205,9 @@ interface IPitBook {
     error ReplacementRefused();
     /// @dev The constructor on a mainnet chain id with an `OWNER_DELAY` under 24 hours.
     error DelayTooShort();
+    /// @notice ETH sent by anyone but the oracle (its refunds during `recordClose` are the only ETH the book
+    ///         takes).
+    error EthNotAccepted();
 
     /// @notice The learned sigma of a round as the book bounds it (`stepSigmaEff`): the sigma in force (0
     ///         until the first update), when it was set, and the product of all its rises so far (WAD; 0
@@ -259,13 +262,16 @@ interface IPitBook {
     /// @param budget the print's budget in WAD chips, computed by the hook from the round's frozen config:
     ///        `capital * riskCapBps * g / 1e4` (`PitMath.riskBudget`, the same as `PitBook.riskBudgetOf`), g the
     ///        round's depth scale at `ts`
-    /// @dev `ts` is the print's own timestamp (`IPitOracle.verifyAt`), not the commit's instant: one print
+    /// @dev A round keeps one sum, for the latest print a fill of it took risk on. A `ts` earlier than that
+    ///      print is charged to that print's sum. `ts` is the print's own timestamp (`IPitOracle.verifyAt`), not the commit's instant: one print
     ///      prices every instant in `(prevTs, ts]`, and all of them share its one budget.
     function takeRisk(bytes32 roundId, uint64 ts, uint256 risk, uint256 budget) external returns (bool);
 
-    /// @notice House risk (WAD chips) the fills of a round priced by the print of `ts` took from its budget.
-    ///         A commit made for instant t is priced by the first print with ts >= t; for a t that has no
-    ///         print yet, that is a print of t itself when the keeper prints every second.
+    /// @notice House risk (WAD chips) the fills of a round priced by the print of `ts` took from its budget,
+    ///         while `ts` is the latest print a fill of the round was priced by; 0 for any other `ts` (a
+    ///         later print starts a new sum, and a fill on an earlier one is charged to the latest). A commit made for
+    ///         instant t is priced by the first print with ts >= t; for a t that has no print yet, that is a
+    ///         print of t itself when the keeper prints every second.
     function riskUsed(bytes32 roundId, uint64 ts) external view returns (uint256);
 
     /// @notice Bounds the vol keeper's next learned sigma for an open round and records it. Only the hook
@@ -281,6 +287,11 @@ interface IPitBook {
     /// @notice The learned sigma state of a round (`SigmaEffState`). `at + SIGMA_EFF_GAP` is the first time
     ///         the next update is accepted.
     function sigmaEffState(bytes32 roundId) external view returns (uint96 sigma, uint64 at, uint96 rise);
+
+    /// @notice The stock token's multiplier recorded with the close of `ticker` on `day` (0 when none). A
+    ///         round whose close and starting close have different multipliers spans a corporate action (a
+    ///         split): it voids instead of settling.
+    function closeMultiplier(bytes32 ticker, uint32 day) external view returns (uint256);
 
     /// @notice Recorded close of `ticker` on `day` (price 0 when none) and whether it is trustless. A late
     ///         close is included: this is the price the next round starts from.

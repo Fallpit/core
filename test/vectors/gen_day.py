@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """One simulated round for the day-level differential test (numpy only).
 
 Run from anywhere:  python3 contracts/test/vectors/gen_day.py

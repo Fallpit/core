@@ -63,7 +63,7 @@ contract DisputesTest is StackFixture {
         _recordCloseOf(day, S0 * 99 / 100, KEEPER);
         hook.settleRound(house, day);
         vm.prank(accomplice);
-        vm.expectRevert(IFallpitHook.WrongStatus.selector);
+        vm.expectRevert(IFallpitHook.VoidNotAllowed.selector);
         hook.voidRound(house, day);
         // It can dispute; that only holds the round open for a correction. With no other valid print
         // for the instant nothing changes, and an hour after the close the round finalizes on it.
@@ -247,5 +247,51 @@ contract DisputesTest is StackFixture {
         _offerCloseRefused(S0 * 970 / 1000, KEEPER, IPitBook.ReplacementRefused.selector);
         hook.finalizeRound(house, day);
         assertEq(hook.getState(roundId).settledPrice, S0 * 990 / 1000);
+    }
+
+    /// @dev A disputed keeper close replaced after the stock token's multiplier changed: the close keeps
+    ///      the multiplier of its first write, so the round re-settles on the new price and finalizes. Before,
+    ///      the replacement re-read the multiplier: finalize refused the changed close, settle refused the
+    ///      corporate action, void refused the settled round, and the house could never open again.
+    function test_replacedClose_keepsItsFirstMultiplier_theRoundFinalizes() public {
+        _lpDeposit(lp, CAPITAL);
+        _open(3600);
+        _fund(eve, 1_000_000e18);
+        _buy(eve, HIGHER, LOT, S0);
+        _recordCloseOf(day, S0 * 99 / 100, KEEPER);
+        uint256 first = book.closeMultiplier(NVDA, day);
+        hook.settleRound(house, day);
+        vm.prank(guardian);
+        book.dispute(roundId);
+        oracle.setMultiplier(NVDA, first * 2);
+        _offerClose(S0 * 102 / 100, KEEPER);
+        assertEq(book.closeMultiplier(NVDA, day), first, "a replacement keeps the first multiplier");
+        hook.settleRound(house, day);
+        assertEq(uint256(_state().settledPrice), S0 * 102 / 100, "re-settled on the replacement");
+        _warp(NYTime.closeTs(day) + 1 hours);
+        hook.finalizeRound(house, day);
+        assertEq(uint8(_state().status), uint8(IFallpitHook.Status.Final));
+    }
+
+    /// @dev If a settled round ever spans a corporate action (a multiplier recorded wrongly), anyone voids it
+    ///      at once, so it never locks the house.
+    function test_settledRoundAcrossACorporateAction_voids() public {
+        _lpDeposit(lp, CAPITAL);
+        _open(3600);
+        _fund(eve, 1_000_000e18);
+        _buy(eve, HIGHER, LOT, S0);
+        _recordCloseOf(day, S0 * 101 / 100, KEEPER);
+        hook.settleRound(house, day);
+        vm.mockCall(
+            address(book), abi.encodeCall(IPitBook.closeMultiplier, (NVDA, day)), abi.encode(uint256(7e18))
+        );
+        vm.expectRevert(IFallpitHook.CorporateAction.selector);
+        hook.settleRound(house, day);
+        hook.voidRound(house, day);
+        vm.clearMockedCalls();
+        assertEq(uint8(_state().status), uint8(IFallpitHook.Status.Void));
+        uint256 higher = _token(HIGHER).id;
+        vm.prank(eve);
+        assertGt(router.redeem(higher, LOT), 0, "the holder gets its cost back");
     }
 }

@@ -204,6 +204,8 @@ interface IFallpitRouter {
     error ZeroAmount();
     error BelowMinimumTrade();
     error BadEscrow();
+    /// @dev A commit's limit does not fit the record's 128 bits (no chip has that many units in a round).
+    error LimitTooLarge();
     /// @dev The native coin sent with a commit is not exactly the round's fill fee.
     error WrongFillFee();
     error NothingToClaim();
@@ -214,6 +216,10 @@ interface IFallpitRouter {
     error UnexpectedDelta();
     /// @dev `execute` called by anyone but this router during its own `fill`.
     error OnlySelf();
+    /// @notice ETH sent to the router by anyone but the hook.
+    error EthNotAccepted();
+    /// @notice `fillBatch` got a different number of reports than commits.
+    error LengthMismatch();
     /// @dev `fill` of a commit while the commit before it with the same round and fill instant is still
     ///      pending: fill that one first.
     error EarlierCommitPending(uint256 prev);
@@ -311,6 +317,13 @@ interface IFallpitRouter {
     /// @dev `msg.value` is for the oracle's update fee, not for the fill fee.
     /// @return filled false when the commit was refunded
     function fill(uint256 commitId, bytes calldata report) external payable returns (bool filled);
+
+    /// @notice `fill` for several commits in one transaction, in the order given, with no ETH (for prints
+    ///         with no oracle fee). A commit that cannot be filled now is skipped, not reverted.
+    /// @return filled per commit: true when it filled, false when it was refunded or skipped
+    function fillBatch(uint256[] calldata commitIds, bytes[] calldata reports)
+        external
+        returns (bool[] memory filled);
 
     /// @notice Refunds a commit nobody filled within its fill window, with its fill fee. Anyone may call.
     function refund(uint256 commitId) external;

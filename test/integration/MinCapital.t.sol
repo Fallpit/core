@@ -5,7 +5,6 @@ import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 
 import {IntegrationFixture} from "./IntegrationFixture.sol";
 import {MockChip} from "../hook/mocks/MockChips.sol";
-import {LadderMath} from "../../src/LadderMath.sol";
 import {IFallpitHook} from "../../src/interfaces/IFallpitHook.sol";
 import {IPitBook} from "../../src/hook/IPitBook.sol";
 import {NYTime} from "../../src/lib/NYTime.sol";
@@ -65,9 +64,9 @@ contract MinCapitalTest is IntegrationFixture {
     /// @dev Why the bound exists: just under it the real engine refuses to open.
     function test_math_refusesACapitalBelowItsLimit() public {
         // alpha * capital = 9e32: the tail bands (ln(1 / pi) about 9.2) get a depth below 1e14 wei
-        vm.expectRevert(LadderMath.InvalidDepth.selector);
+        vm.expectRevert(bytes4(keccak256("InvalidDepth()")));
         math.openDepths(0.02e18, 0.9e18, 0.001e18);
-        vm.expectRevert(LadderMath.InvalidDepth.selector);
+        vm.expectRevert(bytes4(keccak256("InvalidDepth()")));
         math.openDepths(0.02e18, 3e15, 0.3e18);
         // and at the book's bound it opens
         math.openDepths(0.02e18, 1e18, 0.001e18);

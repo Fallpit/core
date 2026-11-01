@@ -255,28 +255,77 @@ contract LadderMath is ILadderMath {
         uint8 hi,
         int256 delta
     ) external pure returns (Fill memory f) {
+        _checkFill(ctx, lo, hi, delta);
+        (f,) = _fillAt(_loadState(v), b0, sigma, ctx, lo, hi, delta, COLD);
+    }
+
+    /// @inheritdoc ILadderMath
+    function fillFrom(
+        int256[40] calldata v,
+        uint256[40] calldata b0,
+        uint256 sigma,
+        Ctx calldata ctx,
+        uint8 lo,
+        uint8 hi,
+        int256 delta,
+        int256 seed
+    ) external pure returns (Fill memory f, int256 lambda) {
+        _checkFill(ctx, lo, hi, delta);
+        return _fillAt(_loadState(v), b0, sigma, ctx, lo, hi, delta, seed);
+    }
+
+    /// @inheritdoc ILadderMath
+    /// @dev The checks run in the order of `depths` then `fillFrom`, as a caller of the two would see them.
+    function fillPacked(PackedIn calldata a, Ctx calldata ctx, uint8 lo, uint8 hi, int256 delta, int256 seed)
+        external
+        pure
+        returns (PackedFill memory p)
+    {
+        uint256[40] memory b0 = _depths(a.lnInv, a.capital, a.alpha);
+        _checkFill(ctx, lo, hi, delta);
+        Fill memory f;
+        (f, p.lambda) = _fillAt(_unpackState(a.v), b0, a.sigma, ctx, lo, hi, delta, seed);
+        p.v = _packState(f.v);
+        (p.amount, p.pBefore, p.pAfter, p.vega) = (f.amount, f.pBefore, f.pAfter, f.vega);
+    }
+
+    /// @dev The argument checks of a fill, before the state is read.
+    function _checkFill(Ctx calldata ctx, uint8 lo, uint8 hi, int256 delta) internal pure {
         if (lo > hi || hi >= BANDS) revert InvalidSet();
         if (FixedPointMathLib.abs(delta) > MAX_MAGNITUDE) revert InvalidDelta();
         if (ctx.gNew == 0 || ctx.gNew > ctx.gOld || ctx.gOld > WAD) revert InvalidDepthScale();
+    }
 
-        // 1. Prior at the fill's oracle price and remaining standard deviation.
-        int256[40] memory w = _loadState(v);
+    /// @dev `fill` with a first guess for the lambda solves. The solves start at `seed` when it lies inside
+    ///      their bracket and at the bracket's lower end otherwise, so the seed changes the number of steps
+    ///      and nothing else beyond the solve's tolerance. Returns the root of the state handed back.
+    function _fillAt(
+        int256[40] memory w,
+        uint256[40] memory b0,
+        uint256 sigma,
+        Ctx calldata ctx,
+        uint8 lo,
+        uint8 hi,
+        int256 delta,
+        int256 seed
+    ) internal pure returns (Fill memory f, int256 lambda) {
+        // 1. Prior at the fill's oracle price and remaining standard deviation. The caller has checked the
+        //    arguments (`_checkFill`) and loaded the state `w`.
         Book memory bk = _book(sigma, ctx.x, ctx.sd);
 
         // 2. Depth rescale around lambda1, the root at the old depth. (Any centre would keep every price
         //    and every cost difference; the spec centres on lambda1, which keeps the state near its level.)
         //    The rescaled state at the new depth has the same root, so it seeds the next solve.
-        int256 seed = COLD;
         if (ctx.gNew < ctx.gOld) {
             _setDepth(bk, b0, ctx.gOld);
-            seed = _solve(w, bk, COLD);
+            seed = _solve(w, bk, seed);
             _rescale(w, seed, ctx.gNew, ctx.gOld);
         }
 
         // 3. Cost and set price before the trade, at the new depth.
         _setDepth(bk, b0, ctx.gNew);
-        int256 lam0 = _solve(w, bk, seed);
-        Quote memory q0 = _quote(w, bk, lam0);
+        lambda = _solve(w, bk, seed);
+        Quote memory q0 = _quote(w, bk, lambda);
         f.pBefore = _setPrice(q0.p, lo, hi);
         f.pAfter = f.pBefore;
 
@@ -291,7 +340,8 @@ contract LadderMath is ILadderMath {
                 }
             }
             // the root after the trade is near the one before it (a warm start)
-            Quote memory q1 = _quote(w, bk, _solve(w, bk, lam0));
+            lambda = _solve(w, bk, lambda);
+            Quote memory q1 = _quote(w, bk, lambda);
             f.pAfter = _setPrice(q1.p, lo, hi);
             f.amount = _amount(q0, q1, f.pBefore, delta);
         }
@@ -385,25 +435,11 @@ contract LadderMath is ILadderMath {
     ///      1e18.
     function _prior(uint256 sigma, int256 x, uint256 sd) internal pure returns (uint256[40] memory pi) {
         _checkAnchor(sigma, x, sd);
-        (uint256 sdLo, uint256 sdMid, uint256 sdHi) = _mixSd(sd);
-        uint256 prev;
-        uint256 sum;
+        uint256 sum = _rawPrior(sigma, x, sd, pi);
         uint256 total;
         uint256 top;
-        // Bound: |x| <= 1e36 and |edge| < 4.8e18, so |ex| < 1.1e54. Each c is at most 1e18, so each raw band
-        // is at most 1e18 and the sum below 41e18; each q is at most 1e18 and the total at most 1e18.
+        // Bound: each q is at most 1e18 and the total at most 1e18.
         unchecked {
-            for (uint256 j; j < BANDS; ++j) {
-                uint256 c = WAD;
-                if (j < EDGES) c = _mixAt((_edge(sigma, j) - x) * int256(WAD), sdLo, sdMid, sdHi);
-                // The CDF is monotone up to its 2 wei error; never let that produce a negative band.
-                if (c < prev) c = prev;
-                uint256 raw = c - prev;
-                if (raw < PRIOR_FLOOR) raw = PRIOR_FLOOR;
-                pi[j] = raw;
-                sum += raw;
-                prev = c;
-            }
             // The first largest band takes the dust.
             uint256 topQ;
             for (uint256 j; j < BANDS; ++j) {
@@ -417,6 +453,32 @@ contract LadderMath is ILadderMath {
             }
         }
         pi[top] += WAD - total;
+    }
+
+    /// @dev The floored band differences of `_prior` before the renormalisation, written into `pi`.
+    /// @return sum their sum
+    function _rawPrior(uint256 sigma, int256 x, uint256 sd, uint256[40] memory pi)
+        private
+        pure
+        returns (uint256 sum)
+    {
+        (uint256 sdLo, uint256 sdMid, uint256 sdHi) = _mixSd(sd);
+        uint256 prev;
+        // Bound: |x| <= 1e36 and |edge| < 4.8e18, so |ex| < 1.1e54. Each c is at most 1e18, so each raw band
+        // is at most 1e18 and the sum below 41e18.
+        unchecked {
+            for (uint256 j; j < BANDS; ++j) {
+                uint256 c = WAD;
+                if (j < EDGES) c = _mixAt((_edge(sigma, j) - x) * int256(WAD), sdLo, sdMid, sdHi);
+                // The CDF is monotone up to its 2 wei error; never let that produce a negative band.
+                if (c < prev) c = prev;
+                uint256 raw = c - prev;
+                if (raw < PRIOR_FLOOR) raw = PRIOR_FLOOR;
+                pi[j] = raw;
+                sum += raw;
+                prev = c;
+            }
+        }
     }
 
     /// @dev Vega(e) = phi(z) * (z - sd) for inner edge m, truncated.
@@ -468,6 +530,44 @@ contract LadderMath is ILadderMath {
         if (bad != 0) revert InvalidState();
     }
 
+    /// @dev The state from its packed form (`PackedBands`: band 2k in the low 128 bits of word k, band 2k+1
+    ///      in the high 128 bits, each signed), with the checks of `_loadState`.
+    function _unpackState(uint256[20] calldata packed) internal pure returns (int256[40] memory w) {
+        uint256 bad;
+        // Bound: the offsets stay inside the 20 words of packed and the 40 of w.
+        assembly ("memory-safe") {
+            for { let k := 0 } lt(k, 20) { k := add(k, 1) } {
+                let word := calldataload(add(packed, shl(5, k)))
+                let p := add(w, shl(6, k))
+                let lo := signextend(15, word)
+                let hi := sar(128, word)
+                mstore(p, lo)
+                mstore(add(p, 32), hi)
+                // |v_j| > 1e36, as in `_outOfRange`
+                bad := or(
+                    bad,
+                    gt(add(lo, 1000000000000000000000000000000000000), 2000000000000000000000000000000000000)
+                )
+                bad := or(
+                    bad,
+                    gt(add(hi, 1000000000000000000000000000000000000), 2000000000000000000000000000000000000)
+                )
+            }
+        }
+        if (bad != 0) revert InvalidState();
+    }
+
+    /// @dev The packed form of a state that `_outOfRange` accepted (every |v_j| at most 1e36 < 2^127).
+    function _packState(int256[40] memory w) internal pure returns (uint256[20] memory packed) {
+        assembly ("memory-safe") {
+            let mask := sub(shl(128, 1), 1)
+            for { let k := 0 } lt(k, 20) { k := add(k, 1) } {
+                let p := add(w, shl(6, k))
+                mstore(add(packed, shl(5, k)), or(and(mload(p), mask), shl(128, mload(add(p, 32)))))
+            }
+        }
+    }
+
     /// @dev True if any |w_j| is above 1e36.
     function _outOfRange(int256[40] memory w) private pure returns (bool bad) {
         // Bound: w_j + 1e36 wraps (mod 2^256) only for w_j < -1e36, to a value above 2^255; it never wraps
@@ -503,7 +603,7 @@ contract LadderMath is ILadderMath {
 
     /// @dev Sets the depths of the book to b0 * g (kept as the exact product, never divided by 1e18).
     ///      Every caller checks g <= 1e18.
-    function _setDepth(Book memory bk, uint256[40] calldata b0, uint256 g) internal pure {
+    function _setDepth(Book memory bk, uint256[40] memory b0, uint256 g) internal pure {
         uint256[40] memory bgs = bk.bg;
         uint256[40] memory pi = bk.pi;
         uint256 bgMax;
@@ -515,7 +615,7 @@ contract LadderMath is ILadderMath {
                 uint256 b;
                 uint256 pj;
                 assembly ("memory-safe") {
-                    b := calldataload(add(b0, o))
+                    b := mload(add(b0, o))
                     pj := mload(add(pi, o))
                 }
                 if (b > MAX_DEPTH) revert InvalidDepth();
@@ -637,19 +737,36 @@ contract LadderMath is ILadderMath {
             }
         }
         // Bound: a_j - top is in [-8.3e48, 0], so e_j <= 1e18; e_j * 1e54 <= 1e72 and bg_j >= 1e24, so
-        // each term of d is below 1e48; s <= 40e18.
-        unchecked {
-            for (uint256 o; o < 1280; o += 32) {
-                int256 aj;
-                assembly ("memory-safe") {
-                    aj := mload(add(a, o))
+        // each term of d is below 1e48; s <= 40e18. `expNeg` is solady's `FixedPointMathLib.expWad`, step for
+        // step, for arguments at most 0 (where it cannot overflow), inlined so the loop stays in assembly.
+        assembly ("memory-safe") {
+            function expNeg(x) -> r {
+                // expWad returns 0 for x <= -41446531673892822313
+                if sgt(x, sub(0, 41446531673892822313)) {
+                    x := sdiv(shl(78, x), 3814697265625)
+                    let k := sar(96, add(sdiv(shl(96, x), 54916777467707473351141471128), shl(95, 1)))
+                    x := sub(x, mul(k, 54916777467707473351141471128))
+                    let y := add(x, 1346386616545796478920950773328)
+                    y := add(sar(96, mul(y, x)), 57155421227552351082224309758442)
+                    let p := sub(add(y, x), 94201549194550492254356042504812)
+                    p := add(sar(96, mul(p, y)), 28719021644029726153956944680412240)
+                    p := add(mul(p, x), shl(96, 4385272521454847904659076985693276))
+                    let q := sub(x, 2855989394907223263936484059900)
+                    q := add(sar(96, mul(q, x)), 50020603652535783019961831881945)
+                    q := sub(sar(96, mul(q, x)), 533845033583426703283633433725380)
+                    q := add(sar(96, mul(q, x)), 3604857256930695427073651918091429)
+                    q := sub(sar(96, mul(q, x)), 14423608567350463180887372962807573)
+                    q := add(sar(96, mul(q, x)), 26449188498355588339934803723976023)
+                    r := shr(sub(195, k), mul(sdiv(p, q), 3822833074963236453042738258902158003155416615667))
                 }
-                uint256 e = uint256(FixedPointMathLib.expWad(aj - top));
-                s += e;
-                assembly ("memory-safe") {
-                    let num := mul(e, 1000000000000000000000000000000000000000000000000000000)
-                    d := add(d, div(num, mload(add(bg, o))))
-                }
+            }
+            for { let o := 0 } lt(o, 1280) { o := add(o, 32) } {
+                let e := expNeg(sub(mload(add(a, o)), top))
+                s := add(s, e)
+                d := add(
+                    d,
+                    div(mul(e, 1000000000000000000000000000000000000000000000000000000), mload(add(bg, o)))
+                )
             }
         }
         g = top + FixedPointMathLib.lnWad(int256(s));
@@ -659,38 +776,55 @@ contract LadderMath is ILadderMath {
                                  COST
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Prices, cost and error bound at a solved lambda. Reverts unless the prices sum to 1 within 1e-12.
-    function _quote(int256[40] memory w, Book memory bk, int256 lam) internal pure returns (Quote memory q) {
-        uint256[40] memory p = q.p;
-        uint256[40] memory pi = bk.pi;
-        uint256[40] memory bg = bk.bg;
-        uint256 s;
-        uint256 t;
+    /// @dev The loop of `_quote`: writes the band prices into `p` and returns their sum `s` and
+    ///      `t` = sum_j b_j * p_j (wei, times 1e36).
+    function _quoteSums(
+        int256[40] memory w,
+        uint256[40] memory pi,
+        uint256[40] memory bg,
+        uint256[40] memory p,
+        int256 lam
+    ) private pure returns (uint256 s, uint256 t) {
         // Bound: u as in `_logSum` (|v_j - lambda| < 4.1e36, bg_j >= 1e24). u <= 60e18 keeps
         // pi_j * exp(u) below 1.2e62; past the checks each p_j <= 2e18 and each term of t is below 2e69.
         unchecked {
             for (uint256 o; o < 1280; o += 32) {
-                int256 u;
+                uint256 pe;
+                {
+                    int256 u;
+                    uint256 pij;
+                    assembly ("memory-safe") {
+                        pij := mload(add(pi, o))
+                        u := sdiv(
+                            mul(sub(mload(add(w, o)), lam), 1000000000000000000000000000000000000),
+                            mload(add(bg, o))
+                        )
+                    }
+                    if (u > MAX_EXPONENT) revert LambdaNotConverged();
+                    // pi_j * exp(u_j) at 1e36 scale. A price above 2 cannot belong to a converged state.
+                    pe = pij * uint256(FixedPointMathLib.expWad(u));
+                }
+                if (pe > 2e36) revert LambdaNotConverged();
+                {
+                    uint256 pj = pe / WAD;
+                    assembly ("memory-safe") {
+                        mstore(add(p, o), pj)
+                    }
+                    s += pj;
+                }
+                // b_j * p_j in wei, times 1e36. Below 2e69 per band.
                 uint256 bgj;
-                uint256 pij;
                 assembly ("memory-safe") {
                     bgj := mload(add(bg, o))
-                    pij := mload(add(pi, o))
-                    u := sdiv(mul(sub(mload(add(w, o)), lam), 1000000000000000000000000000000000000), bgj)
                 }
-                if (u > MAX_EXPONENT) revert LambdaNotConverged();
-                // pi_j * exp(u_j) at 1e36 scale. A price above 2 cannot belong to a converged state.
-                uint256 pe = pij * uint256(FixedPointMathLib.expWad(u));
-                if (pe > 2e36) revert LambdaNotConverged();
-                uint256 pj = pe / WAD;
-                assembly ("memory-safe") {
-                    mstore(add(p, o), pj)
-                }
-                s += pj;
-                // b_j * p_j in wei, times 1e36. Below 2e69 per band.
                 t += FixedPointMathLib.fullMulDiv(bgj, pe, WAD);
             }
         }
+    }
+
+    /// @dev Prices, cost and error bound at a solved lambda. Reverts unless the prices sum to 1 within 1e-12.
+    function _quote(int256[40] memory w, Book memory bk, int256 lam) internal pure returns (Quote memory q) {
+        (uint256 s, uint256 t) = _quoteSums(w, bk.pi, bk.bg, q.p, lam);
         uint256 ds = s > WAD ? s - WAD : WAD - s;
         if (ds > SUM_TOL) revert LambdaNotConverged();
 

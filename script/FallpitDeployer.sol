@@ -2,9 +2,9 @@
 pragma solidity 0.8.26;
 
 import {CommonBase} from "forge-std/Base.sol";
+import {VmSafe} from "forge-std/Vm.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 
-import {LadderMath} from "../src/LadderMath.sol";
 import {PitOracle} from "../src/PitOracle.sol";
 import {ChipGuard} from "../src/ChipGuard.sol";
 import {PitVault} from "../src/PitVault.sol";
@@ -57,7 +57,7 @@ abstract contract FallpitDeployer is CommonBase {
 
     /// @notice Every contract of a full deployment.
     struct Core {
-        LadderMath math;
+        ILadderMath math;
         PitOracle oracle;
         ChipGuard guard;
         PitVault vault;
@@ -94,14 +94,112 @@ abstract contract FallpitDeployer is CommonBase {
 
     error VaultAddressMismatch(address predicted, address actual);
     error Create2Failed();
+    error MathDeployFailed();
     error NoCreate2Factory();
     error HookNotWired(address vaultHook, address hook);
     error RouterDeployerKept(address deployer);
+    error MathCodeMismatch(address math);
+    error LibraryNotLinked(string name, address expected);
+    error LibraryCodeMismatch(string name, address at);
+
+    /// @dev The linked libraries (artifact paths): the hook's, the book's two and the router's.
+    string internal constant ROUND_LOGIC = "RoundLogic.sol:RoundLogic";
+    string internal constant BOOK_RULES = "PitBookRules.sol:PitBookRules";
+    string internal constant BOOK_LOGIC = "PitBookLogic.sol:PitBookLogic";
+    string internal constant SESSION_LOGIC = "SessionLogic.sol:SessionLogic";
+
+    /// @dev LadderMath from its build artifact, not `new LadderMath()`: it builds with more optimizer runs
+    ///      than the rest (foundry.toml), and a file that imports it builds everything it imports with
+    ///      those runs too, which would take the hook over the size limit.
+    ///      Its runtime code must be the artifact's, byte for byte.
+    function _deployMath() internal returns (ILadderMath math) {
+        bytes memory code = vm.getCode("LadderMath.sol:LadderMath");
+        assembly ("memory-safe") {
+            math := create(0, add(code, 0x20), mload(code))
+        }
+        if (address(math) == address(0)) revert MathDeployFailed();
+        if (address(math).codehash != keccak256(vm.getDeployedCode("LadderMath.sol:LadderMath"))) {
+            revert MathCodeMismatch(address(math));
+        }
+    }
+
+    /// @notice Where a linked library lives in a script deployment: forge script links libraries through the
+    ///         deterministic deployment proxy (`CREATE2_FACTORY`, on 46630 and 4663) with the config's
+    ///         `create2_library_salt` (zero, foundry.toml), so the address follows from the library's code.
+    function _libraryAt(string memory artifact) internal view returns (address) {
+        return vm.computeCreate2Address(bytes32(0), keccak256(vm.getCode(artifact)), CREATE2_FACTORY);
+    }
+
+    /// @notice In a script: deploys the linked libraries from the creator through `CREATE2_FACTORY`
+    ///         (nothing to send when forge has deployed them already), then checks that each holds its
+    ///         artifact's code and that the hook and the book are linked to exactly these addresses. A test
+    ///         links its libraries by nonce, so a test skips this.
+    function _deployLibraries() internal {
+        if (!vm.isContext(VmSafe.ForgeContext.ScriptGroup)) return;
+        _deployLibrary(ROUND_LOGIC, type(FallpitHook).creationCode);
+        _deployLibrary(BOOK_RULES, type(PitBook).creationCode);
+        _deployLibrary(BOOK_LOGIC, type(PitBook).creationCode);
+        _deployLibrary(SESSION_LOGIC, type(FallpitRouter).creationCode);
+    }
+
+    function _deployLibrary(string memory artifact, bytes memory linkedInto) private {
+        address at = _libraryAt(artifact);
+        if (at.code.length == 0) {
+            (bool ok,) = CREATE2_FACTORY.call(abi.encodePacked(bytes32(0), vm.getCode(artifact)));
+            if (!ok || at.code.length == 0) revert Create2Failed();
+        }
+        // a library's runtime code starts `PUSH20 <its own address>` (its call guard): the artifact has zeros
+        bytes memory runtime = vm.getDeployedCode(artifact);
+        if (runtime.length > 21 && runtime[0] == 0x73) {
+            for (uint256 i; i < 20; ++i) {
+                runtime[1 + i] = bytes20(at)[i];
+            }
+        }
+        if (at.codehash != keccak256(runtime)) revert LibraryCodeMismatch(artifact, at);
+        if (!_holds(linkedInto, at)) revert LibraryNotLinked(artifact, at);
+    }
+
+    /// @dev True when `code` holds the 20 bytes of `a` (a linked library's address is a PUSH20 operand).
+    function _holds(bytes memory code, address a) private pure returns (bool found) {
+        uint256 want = uint256(uint160(a));
+        uint256 n = code.length;
+        if (n < 20) return false;
+        for (uint256 i; i + 20 <= n; ++i) {
+            uint256 w;
+            assembly ("memory-safe") {
+                w := shr(96, mload(add(add(code, 0x20), i)))
+            }
+            if (w == want) return true;
+        }
+    }
+
+    /// @notice The linked libraries for a deployment record: `"RoundLogic":{...},"PitBookRules":{...}`,
+    ///         `"PitBookLogic":{...}` and `"SessionLogic":{...}`, each with its address and runtime code hash.
+    function _librariesJson() internal view returns (string memory) {
+        string memory hookAndBook = string.concat(
+            _libraryJson("RoundLogic", ROUND_LOGIC), ",", _libraryJson("PitBookRules", BOOK_RULES)
+        );
+        return string.concat(
+            hookAndBook,
+            ",",
+            _libraryJson("PitBookLogic", BOOK_LOGIC),
+            ",",
+            _libraryJson("SessionLogic", SESSION_LOGIC)
+        );
+    }
+
+    function _libraryJson(string memory name, string memory artifact) private view returns (string memory) {
+        address at = _libraryAt(artifact);
+        return string.concat(
+            '"', name, '":{"address":"', vm.toString(at), '","codeHash":"', vm.toString(at.codehash), '"}'
+        );
+    }
 
     /// @notice Deploys and wires every contract. `creator` must be the account whose CREATEs these are.
     function _deployCore(CoreConfig memory cfg, address creator) internal returns (Core memory d) {
         if (CREATE2_FACTORY.code.length == 0) revert NoCreate2Factory();
-        d.math = new LadderMath();
+        _deployLibraries();
+        d.math = _deployMath();
         d.oracle = new PitOracle(IPyth(cfg.pyth), cfg.owner, cfg.signers, cfg.threshold, cfg.signerDelay);
         d.guard = new ChipGuard(cfg.owner);
         d.book = new PitBook(d.oracle, cfg.owner, cfg.ownerDelay);

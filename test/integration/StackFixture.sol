@@ -9,7 +9,6 @@ import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 import {FallpitHook} from "../../src/FallpitHook.sol";
 import {FallpitRouter} from "../../src/FallpitRouter.sol";
 import {Ticket, ticketsOf, ticketOf} from "../Ticket.sol";
-import {LadderMath} from "../../src/LadderMath.sol";
 import {PitVault} from "../../src/PitVault.sol";
 import {PitBook} from "../../src/hook/PitBook.sol";
 import {IPitBook} from "../../src/hook/IPitBook.sol";
@@ -39,14 +38,14 @@ abstract contract StackFixture is Test, StandardMenu {
     uint256 internal constant S0 = 180e18;
     uint256 internal constant SEED_VAR = 0.0004e18; // sigma = 2%
     /// @dev The book's default fill fee: what every commit carries.
-    uint256 internal constant FILL_FEE = 0.0001 ether;
+    uint256 internal constant FILL_FEE = 0.000025 ether;
 
     PoolManager internal pm;
     FallpitRouter internal router;
     FallpitHook internal hook;
     PitBook internal book;
     FallpitLens internal lens;
-    LadderMath internal math;
+    ILadderMath internal math;
     TickOracle internal oracle;
     PitVault internal vault;
     MockChipGuard internal guard;
@@ -72,7 +71,7 @@ abstract contract StackFixture is Test, StandardMenu {
 
         pm = new PoolManager(address(this));
         router = new FallpitRouter(IPoolManager(address(pm)));
-        math = new LadderMath();
+        math = ILadderMath(deployCode("LadderMath.sol:LadderMath"));
         oracle = new TickOracle();
         guard = new MockChipGuard();
         book = new PitBook(IPitOracle(address(oracle)), owner, 24 hours);

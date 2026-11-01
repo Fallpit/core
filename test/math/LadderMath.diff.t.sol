@@ -105,6 +105,25 @@ contract LadderMathDiffTest is LadderMathBase {
         s.prices = vm.parseJsonUintArray(json, ".prices");
     }
 
+    /// @dev Fill `i` (of a strike set priced with `sigma`) of `test_fill_matchesSimReference`, checked; returns the new state.
+    function _simStep(
+        int256[40] memory v,
+        uint256[40] memory b0,
+        ILadderMath.Ctx memory ctx,
+        uint256 margin,
+        uint256 sigma,
+        uint256 i,
+        SimVectors memory s
+    ) internal view returns (int256[40] memory) {
+        ILadderMath.Fill memory f = math.fill(
+            v, b0, sigma, ctx, uint8(s.lo[i]), uint8(s.hi[i]), int256(s.delta[i])
+        );
+        assertLe(_absDiff(f.amount, s.cost[i]), _relTol(s.cost[i]) + margin, "cost vs sim");
+        assertLe(_absDiff(f.pBefore, s.pBefore[i]), _relTol(s.pBefore[i]) + SET_DUST, "pBefore vs sim");
+        assertLe(_absDiff(f.pAfter, s.pAfter[i]), _relTol(s.pAfter[i]) + SET_DUST, "pAfter vs sim");
+        return f.v;
+    }
+
     /// @dev Buys of the six strike sets, priced by the sim's cost_fn and prices (float64).
     function test_fill_matchesSimReference() public view {
         SimVectors memory s = _loadSim();
@@ -117,14 +136,7 @@ contract LadderMathDiffTest is LadderMathBase {
             for (uint256 k; k < s.steps; ++k) {
                 uint256 i = c * s.steps + k;
                 ctx = _ctx(s.x[i], s.sd[i], WAD, WAD);
-                ILadderMath.Fill memory f =
-                    math.fill(v, b0, s.sigma[c], ctx, uint8(s.lo[i]), uint8(s.hi[i]), int256(s.delta[i]));
-                assertLe(_absDiff(f.amount, s.cost[i]), _relTol(s.cost[i]) + margin, "cost vs sim");
-                assertLe(
-                    _absDiff(f.pBefore, s.pBefore[i]), _relTol(s.pBefore[i]) + SET_DUST, "pBefore vs sim"
-                );
-                assertLe(_absDiff(f.pAfter, s.pAfter[i]), _relTol(s.pAfter[i]) + SET_DUST, "pAfter vs sim");
-                v = f.v;
+                v = _simStep(v, b0, ctx, margin, s.sigma[c], i, s);
             }
             uint256[40] memory p = math.prices(v, b0, s.sigma[c], ctx);
             for (uint256 j; j < BANDS; ++j) {
@@ -177,6 +189,36 @@ contract LadderMathDiffTest is LadderMathBase {
         s.prices = vm.parseJsonUintArray(json, ".prices");
     }
 
+    /// @dev Fill `i` (of a sequence priced with `sigma`) of `test_fill_matchesHighPrecisionReference`, checked; returns the new
+    ///      state.
+    function _exactStep(
+        int256[40] memory v,
+        uint256[40] memory b0,
+        ILadderMath.Ctx memory ctx,
+        uint256 margin,
+        uint256 sigma,
+        uint256 i,
+        FillVectors memory s
+    ) internal view returns (int256[40] memory) {
+        ILadderMath.Fill memory f = math.fill(v, b0, sigma, ctx, uint8(s.lo[i]), uint8(s.hi[i]), s.delta[i]);
+        // Rounding direction first: a buy never costs less, a sell never pays more. The reference
+        // amount is rounded to the nearest wei and its depths differ from the on-chain ones by
+        // about 1e-13 relative, hence the relative allowance on the direction check.
+        if (s.delta[i] > 0) {
+            assertGe(f.amount + _relTol(s.amount[i]) + 1, s.amount[i], "buy under-charged");
+        } else {
+            assertLe(f.amount, s.amount[i] + _relTol(s.amount[i]) + 1, "sell over-paid");
+        }
+        assertLe(_absDiff(f.amount, s.amount[i]), _relTol(s.amount[i]) + margin, "amount vs exact");
+        assertLe(_absDiff(f.pBefore, s.pBefore[i]), _relTol(s.pBefore[i]) + SET_DUST, "pBefore");
+        assertLe(_absDiff(f.pAfter, s.pAfter[i]), _relTol(s.pAfter[i]) + SET_DUST, "pAfter");
+        // vega is rounded up: 32 wei of allowance per finite edge on top of an edge value that is
+        // itself within 32 wei, so it lands in [exact, exact + 128]. The reference is floored.
+        assertGe(f.vega, s.vega[i], "vega rounded down");
+        assertLe(f.vega, s.vega[i] + 129, "vega too high");
+        return f.v;
+    }
+
     /// @dev Whole `fill` sequences: re-anchored prior, depth rescale, buys and sells of arbitrary sets.
     function test_fill_matchesHighPrecisionReference() public view {
         FillVectors memory s = _loadFill();
@@ -189,24 +231,7 @@ contract LadderMathDiffTest is LadderMathBase {
             for (uint256 k; k < s.steps; ++k) {
                 uint256 i = c * s.steps + k;
                 ctx = _ctx(s.x[i], s.sd[i], s.gOld[i], s.gNew[i]);
-                ILadderMath.Fill memory f =
-                    math.fill(v, b0, s.sigma[c], ctx, uint8(s.lo[i]), uint8(s.hi[i]), s.delta[i]);
-                // Rounding direction first: a buy never costs less, a sell never pays more. The reference
-                // amount is rounded to the nearest wei and its depths differ from the on-chain ones by
-                // about 1e-13 relative, hence the relative allowance on the direction check.
-                if (s.delta[i] > 0) {
-                    assertGe(f.amount + _relTol(s.amount[i]) + 1, s.amount[i], "buy under-charged");
-                } else {
-                    assertLe(f.amount, s.amount[i] + _relTol(s.amount[i]) + 1, "sell over-paid");
-                }
-                assertLe(_absDiff(f.amount, s.amount[i]), _relTol(s.amount[i]) + margin, "amount vs exact");
-                assertLe(_absDiff(f.pBefore, s.pBefore[i]), _relTol(s.pBefore[i]) + SET_DUST, "pBefore");
-                assertLe(_absDiff(f.pAfter, s.pAfter[i]), _relTol(s.pAfter[i]) + SET_DUST, "pAfter");
-                // vega is rounded up: 32 wei of allowance per finite edge on top of an edge value that is
-                // itself within 32 wei, so it lands in [exact, exact + 128]. The reference is floored.
-                assertGe(f.vega, s.vega[i], "vega rounded down");
-                assertLe(f.vega, s.vega[i] + 129, "vega too high");
-                v = f.v;
+                v = _exactStep(v, b0, ctx, margin, s.sigma[c], i, s);
             }
             ctx.gOld = ctx.gNew;
             uint256[40] memory p = math.prices(v, b0, s.sigma[c], ctx);

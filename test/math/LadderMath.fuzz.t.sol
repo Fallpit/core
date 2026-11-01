@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
+
 import {ILadderMath} from "../../src/interfaces/ILadderMath.sol";
 import {LadderMathBase} from "./LadderMathBase.sol";
 
@@ -45,6 +47,65 @@ contract LadderMathFuzzTest is LadderMathBase {
     }
 
     /*//////////////////////////////////////////////////////////////
+                              SOLVE SEED
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev A seed changes only where the lambda solves start: with any seed (the root of the cold fill,
+    ///      a random guess, or one far outside every bracket) the amount is within the fill's safety margin
+    ///      and the pBefore clamp of the cold fill's, and the prices of the returned state agree to 1e-12.
+    ///      The returned root seeds the next fill to the same result.
+    function testFuzz_fillFrom_seedOnlyChangesTheStart(uint256 seed) public view {
+        Scn memory s = _scenario(seed);
+        Leg memory l;
+        (l.lo, l.hi) = _set(seed, 32);
+        l.d = int256(_size(seed, 33, s.capital));
+        if (_rand(seed, 34) % 3 == 0) l.d = -l.d;
+        uint256 gNew = _rand(seed, 30) % 2 == 0 ? s.g : bound(_rand(seed, 31), 0.3e18, s.g);
+        (, int256 root) =
+            math.fillFrom(s.v, s.b0, s.sigma, _ctx(s.x, s.sd, s.g, gNew), l.lo, l.hi, l.d, type(int256).min);
+        _seedCase(s, gNew, l, root);
+        _seedCase(s, gNew, l, int256(bound(_rand(seed, 35), 0, 2e36)) - 1e36);
+        _seedCase(s, gNew, l, type(int256).max);
+    }
+
+    function _seedCase(Scn memory s, uint256 gNew, Leg memory l, int256 guess) internal view {
+        ILadderMath.Ctx memory ctx = _ctx(s.x, s.sd, s.g, gNew);
+        ILadderMath.Fill memory cold = math.fill(s.v, s.b0, s.sigma, ctx, l.lo, l.hi, l.d);
+        (ILadderMath.Fill memory warm, int256 lam) = _seeded(s.v, s, ctx, l, guess);
+        uint256 tol = _marginBound(s.b0, gNew) + _clampTol(FixedPointMathLib.abs(l.d));
+        assertApproxEqAbs(warm.amount, cold.amount, tol, "amount");
+        assertApproxEqAbs(warm.pBefore, cold.pBefore, PRICE_TOL, "pBefore");
+        assertApproxEqAbs(warm.pAfter, cold.pAfter, PRICE_TOL, "pAfter");
+        ctx = _ctx(s.x, s.sd, gNew, gNew);
+        _samePrices(s, ctx, cold.v, warm.v);
+        // the root it returns is the root of its state: a no-trade fill seeded there prices the same
+        l.d = 0;
+        (ILadderMath.Fill memory again,) = _seeded(warm.v, s, ctx, l, lam);
+        assertApproxEqAbs(again.pBefore, warm.pAfter, PRICE_TOL, "the root seeds the next fill");
+    }
+
+    function _seeded(
+        int256[40] memory v,
+        Scn memory s,
+        ILadderMath.Ctx memory ctx,
+        Leg memory l,
+        int256 guess
+    ) internal view returns (ILadderMath.Fill memory, int256) {
+        return math.fillFrom(v, s.b0, s.sigma, ctx, l.lo, l.hi, l.d, guess);
+    }
+
+    function _samePrices(Scn memory s, ILadderMath.Ctx memory ctx, int256[40] memory a, int256[40] memory b)
+        internal
+        view
+    {
+        uint256[40] memory pa = math.prices(a, s.b0, s.sigma, ctx);
+        uint256[40] memory pb = math.prices(b, s.b0, s.sigma, ctx);
+        for (uint256 j; j < BANDS; ++j) {
+            assertApproxEqAbs(pb[j], pa[j], PRICE_TOL, "band price");
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////
                            PATH INDEPENDENCE
     //////////////////////////////////////////////////////////////*/
 
@@ -53,27 +114,44 @@ contract LadderMathFuzzTest is LadderMathBase {
         return delta > 0 ? int256(f.amount) : -int256(f.amount);
     }
 
+    /// @dev One trade of `testFuzz_pathIndependence`: a set and a signed size.
+    struct Leg {
+        uint8 lo;
+        uint8 hi;
+        int256 d;
+    }
+
+    function _leg(int256[40] memory v, Scn memory s, ILadderMath.Ctx memory ctx, Leg memory l)
+        internal
+        view
+        returns (ILadderMath.Fill memory)
+    {
+        return math.fill(v, s.b0, s.sigma, ctx, l.lo, l.hi, l.d);
+    }
+
     /// @dev A then B costs the same as B then A (any sets, buys or sells) and ends in the same state.
     function testFuzz_pathIndependence(uint256 seed) public view {
         Scn memory s = _scenario(seed);
-        (uint8 loA, uint8 hiA) = _set(seed, 21);
-        (uint8 loB, uint8 hiB) = _set(seed, 22);
-        int256 dA = int256(_size(seed, 23, s.capital));
-        int256 dB = int256(_size(seed, 24, s.capital));
-        if (_rand(seed, 25) % 4 == 0) dA = -dA;
-        if (_rand(seed, 26) % 4 == 0) dB = -dB;
+        Leg memory a;
+        Leg memory b;
+        (a.lo, a.hi) = _set(seed, 21);
+        (b.lo, b.hi) = _set(seed, 22);
+        a.d = int256(_size(seed, 23, s.capital));
+        b.d = int256(_size(seed, 24, s.capital));
+        if (_rand(seed, 25) % 4 == 0) a.d = -a.d;
+        if (_rand(seed, 26) % 4 == 0) b.d = -b.d;
         ILadderMath.Ctx memory ctx = _ctx(s.x, s.sd, s.g, s.g);
 
-        ILadderMath.Fill memory a1 = math.fill(s.v, s.b0, s.sigma, ctx, loA, hiA, dA);
-        ILadderMath.Fill memory b1 = math.fill(a1.v, s.b0, s.sigma, ctx, loB, hiB, dB);
-        ILadderMath.Fill memory b2 = math.fill(s.v, s.b0, s.sigma, ctx, loB, hiB, dB);
-        ILadderMath.Fill memory a2 = math.fill(b2.v, s.b0, s.sigma, ctx, loA, hiA, dA);
+        ILadderMath.Fill memory a1 = _leg(s.v, s, ctx, a);
+        ILadderMath.Fill memory b1 = _leg(a1.v, s, ctx, b);
+        ILadderMath.Fill memory b2 = _leg(s.v, s, ctx, b);
+        ILadderMath.Fill memory a2 = _leg(b2.v, s, ctx, a);
 
         for (uint256 j; j < BANDS; ++j) {
             assertEq(b1.v[j], a2.v[j]);
         }
-        int256 ab = _pay(a1, dA) + _pay(b1, dB);
-        int256 ba = _pay(b2, dB) + _pay(a2, dA);
+        int256 ab = _pay(a1, a.d) + _pay(b1, b.d);
+        int256 ba = _pay(b2, b.d) + _pay(a2, a.d);
         uint256 gross = a1.amount + b1.amount + b2.amount + a2.amount;
         uint256 tol = gross / 4e9 + 4 * _marginBound(s.b0, s.g);
         assertApproxEqAbs(ab, ba, tol);
@@ -146,8 +224,7 @@ contract LadderMathFuzzTest is LadderMathBase {
 
         ILadderMath.Fill memory whole = _fill(s, s.g, lo, hi, sign * int256(size));
         ILadderMath.Fill memory one = _fill(s, s.g, lo, hi, sign * int256(part));
-        ILadderMath.Fill memory two =
-            math.fill(one.v, s.b0, s.sigma, _ctx(s.x, s.sd, s.g, s.g), lo, hi, sign * int256(size - part));
+        ILadderMath.Fill memory two = _fillFrom(one.v, s, lo, hi, sign * int256(size - part));
         // The whole trade carries one margin, the split carries two: allow the whole to exceed the split
         // by one margin on a buy (and the reverse on a sell). Splitting never gains more than that dust.
         uint256 margin = _marginBound(s.b0, s.g);
@@ -258,21 +335,24 @@ contract LadderMathFuzzTest is LadderMathBase {
         for (uint256 j; j < BANDS; ++j) {
             v[j] = bound(int256(_rand(seed, 100 + j) >> 1), -span, span);
         }
-        uint256 gOld = bound(_rand(seed, 6), 0.1e18, WAD);
-        uint256 gNew = bound(_rand(seed, 7), 0.1e18, gOld);
-        int256 x = bound(int256(_rand(seed, 8) >> 1), -1e36, 1e36);
-        if (_rand(seed, 9) % 2 == 0) x = bound(x, -int256(sigma) * 10, int256(sigma) * 10);
-        uint256 sd = 10 ** bound(_rand(seed, 10), 0, 36);
-        if (_rand(seed, 11) % 2 == 0) sd = bound(_rand(seed, 12), sigma / 100, sigma * 2);
+        ILadderMath.Ctx memory ctx;
+        {
+            uint256 gOld = bound(_rand(seed, 6), 0.1e18, WAD);
+            uint256 gNew = bound(_rand(seed, 7), 0.1e18, gOld);
+            int256 x = bound(int256(_rand(seed, 8) >> 1), -1e36, 1e36);
+            if (_rand(seed, 9) % 2 == 0) x = bound(x, -int256(sigma) * 10, int256(sigma) * 10);
+            uint256 sd = 10 ** bound(_rand(seed, 10), 0, 36);
+            if (_rand(seed, 11) % 2 == 0) sd = bound(_rand(seed, 12), sigma / 100, sigma * 2);
+            ctx = _ctx(x, sd, gOld, gNew);
+        }
         (uint8 lo, uint8 hi) = _set(seed, 13);
         int256 delta = int256(10 ** bound(_rand(seed, 14), 0, 35));
-        ILadderMath.Ctx memory ctx = _ctx(x, sd, gOld, gNew);
 
         ILadderMath.Fill memory buy = math.fill(v, b0, sigma, ctx, lo, hi, delta);
         ILadderMath.Fill memory sell = math.fill(v, b0, sigma, ctx, lo, hi, -delta);
         assertGe(buy.amount, sell.amount);
         assertLe(sell.amount, uint256(delta));
-        ctx.gOld = gNew;
+        ctx.gOld = ctx.gNew;
         ILadderMath.Fill memory back = math.fill(buy.v, b0, sigma, ctx, lo, hi, -delta);
         assertLe(back.amount, buy.amount, "round trip profit");
     }

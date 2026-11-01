@@ -41,14 +41,14 @@ contract FillOrderTest is StackFixture {
     function _backrun(uint8 product, uint256 price) internal returns (int256 eveNet, uint256 victimExtra) {
         _buy(eve, product, LOT, price); // eve's inventory from before
         _warp(clock + 10);
-        uint256 snap = vm.snapshotState();
         uint256 alone;
         {
+            uint256 snap = vm.snapshotState();
             uint256 b = chip.balanceOf(victim);
             _fillAt(_commitBuy(victim, product, LOT, b), price);
             alone = b - chip.balanceOf(victim);
+            vm.revertToState(snap);
         }
-        vm.revertToState(snap);
 
         uint256 eveBefore = chip.balanceOf(eve);
         uint256 vBefore = chip.balanceOf(victim);
@@ -57,16 +57,20 @@ contract FillOrderTest is StackFixture {
         uint256 s = _commitSell(eve, product, LOT);
         assertEq(router.getCommit(a).prev, v, "eve's buy comes after the victim's");
         assertEq(router.getCommit(s).prev, a);
-        uint256 vp = router.getCommit(v).prev;
-        assertTrue(
-            vp == 0 || router.getCommit(vp).status != IFallpitRouter.CommitStatus.Pending,
-            "nothing pending before the victim's"
-        );
+        {
+            uint256 vp = router.getCommit(v).prev;
+            assertTrue(
+                vp == 0 || router.getCommit(vp).status != IFallpitRouter.CommitStatus.Pending,
+                "nothing pending before the victim's"
+            );
+        }
 
         // Eve's order is refused: her buy cannot go before the victim's, her sell not before her buy.
-        uint64 t = router.getCommit(v).fillTs;
-        _warp(t);
-        oracle.set(NVDA, KEEPER, t, price);
+        {
+            uint64 t = router.getCommit(v).fillTs;
+            _warp(t);
+            oracle.set(NVDA, KEEPER, t, price);
+        }
         vm.prank(eve);
         vm.expectRevert(abi.encodeWithSelector(IFallpitRouter.EarlierCommitPending.selector, v));
         router.fill(a, abi.encode(KEEPER));

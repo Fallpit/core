@@ -110,13 +110,15 @@ contract DeployMainnet is Script, FallpitDeployer {
         uint256 head = chainHead();
 
         (c, sources) = deployAll(r, rows, deployer);
-        if (r.owner != deployer && vm.envOr("HANDOVER", true)) _handOver(c, r.owner);
+        // the book is offered at once (two-step: OWNER calls acceptOwnership); the other owner roles move
+        // with `handOver` once OWNER has asked for them (two-step: a wrong OWNER cannot take them)
+        if (r.owner != deployer && vm.envOr("HANDOVER", true)) c.book.transferOwnership(r.owner);
         vm.stopBroadcast();
 
         string memory file = deploymentsFile();
         vm.writeFile(file, deploymentJson(r, rows, c, sources, deployer, head, block.timestamp));
         console.log("deployment record written to", file);
-        _log(r, c, sources, rows);
+        _log(r, c, sources, rows, deployer);
     }
 
     /// @notice The whole setup with `creator` as the account of the CREATEs (the broadcaster in `run`, the
@@ -195,8 +197,12 @@ contract DeployMainnet is Script, FallpitDeployer {
         vm.stopBroadcast();
     }
 
-    /// @notice Last run with HANDOVER=false: every owner role goes to OWNER (`PitBook` is offered: OWNER
-    ///         calls `acceptOwnership()`). Reads DEPLOYMENTS_FILE or `deployments/4663.json` for the addresses.
+    /// @notice Moves every owner role to OWNER, two-step for each: first OWNER calls
+    ///         `requestOwnershipHandover()` on PitOracle, ChipGuard, CommunityTreasury, AnchorRegistry and
+    ///         PitLister (each request holds 48 hours), then the deployer runs this, which completes them
+    ///         (`completeOwnershipHandover(OWNER)`: it reverts for an OWNER that did not ask, so a wrong
+    ///         address cannot receive them). `PitBook` is offered: OWNER calls `acceptOwnership()`. Reads
+    ///         DEPLOYMENTS_FILE or `deployments/4663.json` for the addresses.
     function handOver() external {
         address owner = vm.envAddress("OWNER");
         _role("OWNER", owner);
@@ -222,12 +228,12 @@ contract DeployMainnet is Script, FallpitDeployer {
     /// @dev The deployer keeps nothing: it renounced the router's deployer rights in the deploy
     ///      (`FallpitDeployer._deployCore`), and here it hands every owner role to OWNER.
     function _handOver(Core memory c, address owner) internal {
-        c.oracle.transferOwnership(owner);
-        c.guard.transferOwnership(owner);
-        c.treasury.transferOwnership(owner);
-        c.registry.transferOwnership(owner);
-        c.lister.transferOwnership(owner);
-        c.book.transferOwnership(owner); // two-step: OWNER calls acceptOwnership()
+        c.oracle.completeOwnershipHandover(owner);
+        c.guard.completeOwnershipHandover(owner);
+        c.treasury.completeOwnershipHandover(owner);
+        c.registry.completeOwnershipHandover(owner);
+        c.lister.completeOwnershipHandover(owner);
+        if (c.book.pendingOwner() != owner) c.book.transferOwnership(owner); // two-step: OWNER accepts
     }
 
     // ---------------------------------------------------------------------------------- configuration
@@ -270,10 +276,13 @@ contract DeployMainnet is Script, FallpitDeployer {
         if (a == address(0) || a == LEAKED) revert BadRole(name, a);
     }
 
-    /// @dev DEPLOYER_PRIVATE_KEY when it is set; else the wallet given on the command line (`--interactive`,
-    ///      `--account` or `--ledger`, with `--sender`), so a key never has to be in a file.
+    /// @dev The wallet given on the command line (`--interactive`, `--account` or `--ledger`, with `--sender`),
+    ///      so a key never has to be in a file. Only with no `--sender` (msg.sender is forge's default) is
+    ///      DEPLOYER_PRIVATE_KEY used: forge loads `contracts/.env` by itself, and a testnet key there must
+    ///      not deploy mainnet in place of the wallet the command names. On mainnet a wallet must be named.
     function _startBroadcast() internal returns (address deployer) {
-        uint256 key = vm.envOr("DEPLOYER_PRIVATE_KEY", uint256(0));
+        if (block.chainid == 4663 && msg.sender == DEFAULT_SENDER) revert BadRole("DEPLOYER", msg.sender);
+        uint256 key = msg.sender == DEFAULT_SENDER ? vm.envOr("DEPLOYER_PRIVATE_KEY", uint256(0)) : 0;
         if (key != 0) {
             deployer = vm.addr(key);
             vm.startBroadcast(key);
@@ -281,6 +290,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             deployer = msg.sender;
             vm.startBroadcast();
         }
+        _role("DEPLOYER", deployer);
     }
 
     /// @notice `TICKERS` out of the table, or the whole table.
@@ -301,17 +311,34 @@ contract DeployMainnet is Script, FallpitDeployer {
         }
     }
 
-    /// @notice The listable tickers (the keeper-signed stocks with a Chainlink bound and the two
-    ///         trustless ones), and ETH.
+    /// @notice Whether the launch deploys the Pyth feeds. It does not: the operator's Hermes key has no feed
+    ///         entitlements, and a ticker with a Pyth feed closes on Pyth only (`PitOracle` refuses a keeper
+    ///         close for it). So every ticker launches `KeeperOnly`, with no Pyth feed: one close source, the
+    ///         keeper set bounded by Chainlink. `pythTable` keeps the feed ids for the later config change.
+    bool public constant PYTH_AT_LAUNCH = false;
+
+    /// @notice The listable tickers as the launch deploys them (see `PYTH_AT_LAUNCH`), and ETH.
+    function tickerTable() public pure returns (TickerRow[] memory) {
+        return _table(PYTH_AT_LAUNCH);
+    }
+
+    /// @notice The same tickers with their Pyth feed ids, and TSLA and QQQ `TrustlessOnly`: what a later
+    ///         `PitOracle.setTicker` (24 hours) and book change would add once a Hermes key is entitled.
+    function pythTable() public pure returns (TickerRow[] memory) {
+        return _table(true);
+    }
+
     /// @dev Left out: GLD (its Chainlink feed is a DEX-state price, not a market price) and SGOV (a T-bill
-    ///      fund: its daily move is far under the book's least variance, 0.5% a day). TSLA and QQQ are
-    ///      `TrustlessOnly` (on a Pyth feed the filler can read); every other ticker is `KeeperOnly`, bounded by
-    ///      its Chainlink feed. Volatilities are first estimates; vol learning corrects them per house.
-    function tickerTable() public pure returns (TickerRow[] memory t) {
+    ///      fund: its daily move is far under the book's least variance, 0.5% a day). With Pyth, TSLA and QQQ
+    ///      are `TrustlessOnly` (on a Pyth feed the filler can read); every other ticker is `KeeperOnly`,
+    ///      bounded by its Chainlink feed. Volatilities are first estimates; vol learning corrects them per
+    ///      house.
+    function _table(bool withPyth) internal pure returns (TickerRow[] memory t) {
         t = new TickerRow[](35);
         uint256 i;
-        t[i++] = _eth();
+        t[i++] = _eth(withPyth);
         t[i++] = _stock(
+            withPyth,
             "TSLA",
             0x322F0929c4625eD5bAd873c95208D54E1c003b2d,
             0x4A1166a659A55625345e9515b32adECea5547C38,
@@ -320,6 +347,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             true
         );
         t[i++] = _stock(
+            withPyth,
             "QQQ",
             0xD5f3879160bc7c32ebb4dC785F8a4F505888de68,
             0x80901d846d5D7B030F26B480776EE3b29374C2ae,
@@ -328,6 +356,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             true
         );
         t[i++] = _stock(
+            withPyth,
             "SPY",
             0x117cc2133c37B721F49dE2A7a74833232B3B4C0C,
             0x319724394D3A0e3669269846abE664Cd621f9f6A,
@@ -336,6 +365,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "NVDA",
             0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC,
             0x379EC4f7C378F34a1B47E4F3cbeBCbAC3E8E9F15,
@@ -344,6 +374,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "AAPL",
             0xaF3D76f1834A1d425780943C99Ea8A608f8a93f9,
             0x6B22A786bAa607d76728168703a39Ea9C99f2cD0,
@@ -352,6 +383,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "MSFT",
             0xe93237C50D904957Cf27E7B1133b510C669c2e74,
             0x45C3C877C15E6BA2EBB19eA114Ea508d14C1Af2E,
@@ -360,6 +392,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "AMZN",
             0x12f190a9F9d7D37a250758b26824B97CE941bF54,
             0xD5a1508ceD74c084eBf3cBe853e2C968fB2a651C,
@@ -368,6 +401,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "GOOGL",
             0x2e0847E8910a9732eB3fb1bb4b70a580ADAD4FE3,
             0xF6f373a037c30F0e5010d854385cA89185AE638b,
@@ -376,6 +410,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "META",
             0xc0D6457C16Cc70d6790Dd43521C899C87ce02f35,
             0x7C38C00C30BEe9378381E7B6135d7283356D71b1,
@@ -384,6 +419,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "AMD",
             0x86923f96303D656E4aa86D9d42D1e57ad2023fdC,
             0x943A29E7ae51A4798823ca9eEd2ed533B2A22C72,
@@ -392,6 +428,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "INTC",
             0xc72b96e0E48ecd4DC75E1e45396e26300BC39681,
             0x3f390C5C24628Ac7C489515402235FeAD71D1913,
@@ -400,6 +437,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "MU",
             0xfF080c8ce2E5feadaCa0Da81314Ae59D232d4afD,
             0x425EEFdCf05ed6526C3cE61Af99429A228a6d596,
@@ -408,6 +446,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "ORCL",
             0xb0992820E760d836549ba69BC7598b4af75dEE03,
             0x0e6a64a2B58A6693a531E6c555f3A5d042eEA844,
@@ -416,6 +455,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "ASML",
             0x47F93d52cBeC7C6D2CfC080e154002370a60dAEA,
             0xB4106147E8cce40b7d46124090d373A71b70f87D,
@@ -424,6 +464,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "TSM",
             0x58FfE4a942d3885bAa22D7520691F611EF09e7AA,
             0x874cF94aa8eC88Fd9560094dD065f2fB3E41Fc2F,
@@ -432,6 +473,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "DELL",
             0x941AE714EC6D8130c7B75d67160Ca08f1e7d11Dd,
             0x1C6c8cADBe02E19129c39dDB92281cE4c0bf206b,
@@ -440,6 +482,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "SNDK",
             0xB90A19fF0Af67f7779afF50A882A9CfF42446400,
             0xfb133Fa4B7b385802B693a293606682Df47109A3,
@@ -448,6 +491,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "BABA",
             0xad25Ac6C84D497db898fa1E8387bf6Af3532a1c4,
             0x62Cc8F9b5f56a33c9C8A60c8B92779f523c4E984,
@@ -456,6 +500,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "PLTR",
             0x894E1EC2D74FFE5AEF8Dc8A9e84686acCB964F2A,
             0x820ABedFF239034956B7A9d2F0a331f9F075eB4c,
@@ -464,6 +509,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "COIN",
             0x6330D8C3178a418788dF01a47479c0ce7CCF450b,
             0xA3a468A452940B7D6b69991207B508c609a98Ef2,
@@ -472,6 +518,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "MSTR",
             0xec262a75e413fAfD0dF80480274532C79D42da09,
             0x396118bdFB181e6240E74D243F266B061c0edc3D,
@@ -480,6 +527,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "GME",
             0x1b0E319c6A659F002271B69dB8A7df2F911c153E,
             0x27C71df6A64fB476468EdF256CF72c038baB5B67,
@@ -488,6 +536,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "CRCL",
             0xdF0992E440dD0be65BD8439b609d6D4366bf1CB5,
             0x6652eDf64bA3731C4F2D3ce821A0Fb1f1f6b482a,
@@ -496,6 +545,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "CRWV",
             0x5f10A1C971B69e47e059e1dC91901B59b3fB49C3,
             0xe1b3aABCAFAd1c94708dc1367dcfF8Aa4407487C,
@@ -504,6 +554,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "NBIS",
             0x9D9c6684F596F66a64C030B93A886D51Fd4D7931,
             0xE1D87B116Ba0fe898998f1D140339D1fA1E09705,
@@ -512,6 +563,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "IONQ",
             0x558378E000D634A36593E338eBacdd6207640EfE,
             0x22EfeC4919baf55F360E0EDee4AbEB26DE4971eb,
@@ -520,6 +572,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "RGTI",
             0x284358abc07F9359f19f4b5b4aC91901Be2597Ba,
             0x2A045cF1C49c61c166C036d2f06FA2D2d984f765,
@@ -528,6 +581,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "RKLB",
             0x3b14C39E89D60D627b42a1A4CA45b5bb45Fc12e2,
             0x045477BF65Aef6f4F2386ad0164579e48381CC74,
@@ -536,6 +590,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "CLSK",
             0xcBB95BBF36099d34dA091dc6Fa6F49EfA257Cee3,
             0x810c12D3a554Bc47fd39597Fe3b3AAC4941F50eF,
@@ -544,6 +599,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "USAR",
             0xd917B029C761D264c6A312BBbcDA868658eF86a6,
             0xA994d3684e8400A6c8078226925779FdeE682DD9,
@@ -552,6 +608,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "SPCX",
             0x4a0E65A3EcceC6dBe60AE065F2e7bb85Fae35eEa,
             0xB265810950ba6c5C0Ff821c9963014a56fD8Bffb,
@@ -560,6 +617,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "SLV",
             0x411eFb0E7f985935DAec3D4C3ebaEa0d0AD7D89f,
             0x209b73908e92Ae021826eD79609845451Ecba2ce,
@@ -568,6 +626,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "USO",
             0xa30FA36Db767ad9eD3f7a60fC79526fB4d56D344,
             0x75a9c76Ef439e2C7c2E5a34Ab105EcFe3766431c,
@@ -576,6 +635,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             false
         );
         t[i++] = _stock(
+            withPyth,
             "EWY",
             0x7f0aBeF0C07280F82c6a08ead09dEd6BAE2C13Fc,
             0xEFdf54610B62A7753Ec30bDc380847c12D32e1D1,
@@ -665,31 +725,37 @@ contract DeployMainnet is Script, FallpitDeployer {
         return v * v / 1e18;
     }
 
-    function _eth() internal pure returns (TickerRow memory) {
+    function _eth(bool withPyth) internal pure returns (TickerRow memory) {
         return TickerRow(
             "ETH",
             address(0),
             ETH_USD,
-            0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace,
+            withPyth
+                ? bytes32(0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace)
+                : bytes32(0),
             350,
             IPitBook.Clock.EveryDay,
             IPitBook.FillSource.KeeperOnly
         );
     }
 
-    function _stock(string memory s, address token, address feed, bytes32 pyth, uint16 vol, bool trustless)
-        internal
-        pure
-        returns (TickerRow memory)
-    {
+    function _stock(
+        bool withPyth,
+        string memory s,
+        address token,
+        address feed,
+        bytes32 pyth,
+        uint16 vol,
+        bool trustless
+    ) internal pure returns (TickerRow memory) {
         return TickerRow(
             s,
             token,
             feed,
-            pyth,
+            withPyth ? pyth : bytes32(0),
             vol,
             IPitBook.Clock.NYWeekdays,
-            trustless ? IPitBook.FillSource.TrustlessOnly : IPitBook.FillSource.KeeperOnly
+            withPyth && trustless ? IPitBook.FillSource.TrustlessOnly : IPitBook.FillSource.KeeperOnly
         );
     }
 
@@ -720,52 +786,60 @@ contract DeployMainnet is Script, FallpitDeployer {
     ) public view returns (string memory) {
         uint256 inForce = at + DELAY;
         string memory top = string.concat(
-            '{"schema":1,"chainId":',
-            vm.toString(block.chainid),
-            ',"deployedAt":',
-            vm.toString(at),
-            ',"deployer":',
-            _q(vm.toString(deployer)),
-            ',"roles":',
-            _rolesJson(r),
-            ',"external":{"poolManager":',
-            _q(vm.toString(POOL_MANAGER)),
-            ',"pyth":',
-            _q(vm.toString(PYTH)),
+            string.concat(
+                '{"schema":1,"chainId":', vm.toString(block.chainid), ',"deployedAt":', vm.toString(at)
+            ),
+            string.concat(',"deployer":', _q(vm.toString(deployer)), ',"roles":', _rolesJson(r)),
+            string.concat(
+                ',"external":{"poolManager":',
+                _q(vm.toString(POOL_MANAGER)),
+                ',"pyth":',
+                _q(vm.toString(PYTH))
+            ),
             "}"
         );
         return string.concat(
-            top,
-            ',"contracts":{',
-            _contractsJson(c, head),
-            '},"chips":[],"tickers":[',
-            _tickersJson(rows, head, inForce),
-            '],"housesFrom":',
-            vm.toString(inForce),
-            ',"housesBlock":0,"houses":[],"listing":{"sources":{',
-            _sourcesJson(sources),
-            "}}}"
+            string.concat(
+                top,
+                string.concat(',"contracts":{', _contractsJson(c, head), '},"libraries":{', _librariesJson()),
+                '},"chips":[],"tickers":['
+            ),
+            string.concat(
+                _tickersJson(rows, head, inForce),
+                '],"housesFrom":',
+                vm.toString(inForce),
+                ',"housesBlock":0,"houses":[],"listing":{"sources":{'
+            ),
+            string.concat(_sourcesJson(sources), "}}}")
         );
     }
 
     function _contractsJson(Core memory c, uint256 head) internal pure returns (string memory) {
         string memory a = string.concat(
-            _entry("LadderMath", address(c.math), head, false),
-            _entry("PitOracle", address(c.oracle), head, false),
-            _entry("ChipGuard", address(c.guard), head, false),
-            _entry("PitVault", address(c.vault), head, false),
-            _entry("PitBook", address(c.book), head, false),
-            _entry("FallpitRouter", address(c.router), head, false),
-            _entry("FallpitHook", address(c.hook), head, false)
+            string.concat(
+                _entry("LadderMath", address(c.math), head, false),
+                _entry("PitOracle", address(c.oracle), head, false),
+                _entry("ChipGuard", address(c.guard), head, false),
+                _entry("PitVault", address(c.vault), head, false)
+            ),
+            string.concat(
+                _entry("PitBook", address(c.book), head, false),
+                _entry("FallpitRouter", address(c.router), head, false),
+                _entry("FallpitHook", address(c.hook), head, false)
+            )
         );
         return string.concat(
-            a,
-            _entry("FallpitLens", address(c.lens), head, false),
-            _entry("FallpitDirectory", address(c.directory), head, false),
-            _entry("CommunityTreasury", address(c.treasury), head, false),
-            _entry("AnchorRegistry", address(c.registry), head, false),
-            _entry("PitLister", address(c.lister), head, false),
-            _entry("VaultFeeForwarderFactory", address(c.forwarders), head, true)
+            string.concat(
+                a,
+                _entry("FallpitLens", address(c.lens), head, false),
+                _entry("FallpitDirectory", address(c.directory), head, false),
+                _entry("CommunityTreasury", address(c.treasury), head, false)
+            ),
+            string.concat(
+                _entry("AnchorRegistry", address(c.registry), head, false),
+                _entry("PitLister", address(c.lister), head, false),
+                _entry("VaultFeeForwarderFactory", address(c.forwarders), head, true)
+            )
         );
     }
 
@@ -775,18 +849,14 @@ contract DeployMainnet is Script, FallpitDeployer {
             signers = string.concat(signers, i == 0 ? "" : ",", _q(vm.toString(r.signers[i])));
         }
         return string.concat(
-            '{"owner":',
-            _q(vm.toString(r.owner)),
-            ',"guardian":',
-            _q(vm.toString(r.guardian)),
-            ',"volKeeper":',
-            _q(vm.toString(r.volKeeper)),
-            ',"feeRecipient":',
-            _q(vm.toString(r.feeRecipient)),
-            ',"keeperSigners":[',
-            signers,
-            '],"keeperThreshold":',
-            vm.toString(r.threshold),
+            string.concat('{"owner":', _q(vm.toString(r.owner)), ',"guardian":', _q(vm.toString(r.guardian))),
+            string.concat(
+                ',"volKeeper":',
+                _q(vm.toString(r.volKeeper)),
+                ',"feeRecipient":',
+                _q(vm.toString(r.feeRecipient))
+            ),
+            string.concat(',"keeperSigners":[', signers, '],"keeperThreshold":', vm.toString(r.threshold)),
             "}"
         );
     }
@@ -799,32 +869,37 @@ contract DeployMainnet is Script, FallpitDeployer {
         for (uint256 i; i < rows.length; ++i) {
             TickerRow memory t = rows[i];
             json = string.concat(
-                json,
-                i == 0 ? "{" : ",{",
-                '"symbol":',
-                _q(t.symbol),
-                ',"id":',
-                _q(vm.toString(LibString.toSmallString(t.symbol))),
-                ',"clock":',
-                _q(t.clock == IPitBook.Clock.EveryDay ? "EveryDay" : "NYWeekdays"),
-                ',"fillSource":',
-                _q(t.fillSource == IPitBook.FillSource.TrustlessOnly ? "TrustlessOnly" : "KeeperOnly"),
+                string.concat(json, i == 0 ? "{" : ",{", '"symbol":', _q(t.symbol)),
                 string.concat(
-                    ',"windows":',
-                    vm.toString(t.clock == IPitBook.Clock.EveryDay ? uint256(15) : uint256(13)),
-                    ',"pythFeedId":',
-                    _q(vm.toString(t.pythFeedId)),
-                    ',"mirrorFeed":',
-                    _q(vm.toString(t.aggregator)),
-                    ',"aggregator":',
-                    _q(vm.toString(t.aggregator)),
-                    ',"stockToken":',
-                    _q(vm.toString(t.stockToken)),
-                    ',"registeredBlock":',
-                    vm.toString(head),
-                    ',"inForceAt":',
-                    vm.toString(inForce),
-                    "}"
+                    ',"id":',
+                    _q(vm.toString(LibString.toSmallString(t.symbol))),
+                    ',"clock":',
+                    _q(t.clock == IPitBook.Clock.EveryDay ? "EveryDay" : "NYWeekdays")
+                ),
+                string.concat(
+                    ',"fillSource":',
+                    _q(t.fillSource == IPitBook.FillSource.TrustlessOnly ? "TrustlessOnly" : "KeeperOnly"),
+                    string.concat(
+                        string.concat(
+                            ',"windows":',
+                            vm.toString(t.clock == IPitBook.Clock.EveryDay ? uint256(15) : uint256(13)),
+                            ',"pythFeedId":',
+                            _q(vm.toString(t.pythFeedId))
+                        ),
+                        string.concat(
+                            ',"mirrorFeed":',
+                            _q(vm.toString(t.aggregator)),
+                            ',"aggregator":',
+                            _q(vm.toString(t.aggregator))
+                        ),
+                        string.concat(
+                            ',"stockToken":',
+                            _q(vm.toString(t.stockToken)),
+                            ',"registeredBlock":',
+                            vm.toString(head)
+                        ),
+                        string.concat(',"inForceAt":', vm.toString(inForce), "}")
+                    )
                 )
             );
         }
@@ -834,7 +909,8 @@ contract DeployMainnet is Script, FallpitDeployer {
         Launchpad[] memory pads = launchpads();
         for (uint256 i; i < sources.length; ++i) {
             json = string.concat(
-                json, i == 0 ? "" : ",", _q(LibString.toHexString(address(sources[i]))), ":", _q(pads[i].key)
+                string.concat(json, i == 0 ? "" : ",", _q(LibString.toHexString(address(sources[i]))), ":"),
+                _q(pads[i].key)
             );
         }
     }
@@ -845,12 +921,8 @@ contract DeployMainnet is Script, FallpitDeployer {
         returns (string memory)
     {
         return string.concat(
-            _q(name),
-            ':{"address":',
-            _q(vm.toString(at)),
-            ',"deployBlock":',
-            vm.toString(head),
-            last ? "}" : "},"
+            string.concat(_q(name), ':{"address":', _q(vm.toString(at)), ',"deployBlock":'),
+            string.concat(vm.toString(head), last ? "}" : "},")
         );
     }
 
@@ -867,10 +939,13 @@ contract DeployMainnet is Script, FallpitDeployer {
         return a;
     }
 
-    function _log(Roles memory r, Core memory c, LaunchRecordSource[] memory sources, TickerRow[] memory rows)
-        internal
-        pure
-    {
+    function _log(
+        Roles memory r,
+        Core memory c,
+        LaunchRecordSource[] memory sources,
+        TickerRow[] memory rows,
+        address deployer
+    ) internal pure {
         console.log("owner", r.owner);
         console.log("PitVault", address(c.vault));
         console.log("PitBook", address(c.book));
@@ -883,6 +958,10 @@ contract DeployMainnet is Script, FallpitDeployer {
         console.log("VaultFeeForwarderFactory", address(c.forwarders));
         console.log("tickers", rows.length, "anchor sources", sources.length);
         console.log("NEXT: tickers take houses 24 hours from now (OWNER_DELAY)");
-        console.log("NEXT: OWNER calls PitBook.acceptOwnership() at", address(c.book), "after the hand-over");
+        if (r.owner != deployer) {
+            console.log(
+                "NEXT: OWNER calls PitBook.acceptOwnership() at", address(c.book), "after the hand-over"
+            );
+        }
     }
 }

@@ -2,7 +2,6 @@
 pragma solidity 0.8.26;
 
 import {HookFixture} from "./HookFixture.sol";
-import {LadderMath} from "../../src/LadderMath.sol";
 import {IFallpitHook} from "../../src/interfaces/IFallpitHook.sol";
 import {FallpitLens} from "../../src/hook/FallpitLens.sol";
 
@@ -16,7 +15,7 @@ contract FallpitSigmaEffTest is HookFixture {
     uint256 internal constant SIGMA = 0.02e18; // sqrt(SEED_VAR)
 
     function _mathAddress() internal override returns (address) {
-        return address(new LadderMath());
+        return deployCode("LadderMath.sol:LadderMath");
     }
 
     function setUp() public override {

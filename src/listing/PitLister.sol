@@ -145,11 +145,25 @@ contract PitLister is IPitLister, Ownable, EIP712 {
         bytes calldata signature
     ) internal returns (bytes32 house) {
         _checkQuote(chip, quote, signature);
-        uint256 least = minSeed(chip, quote.coinsPerUsd);
-        if (seed < least) revert SeedTooSmall(seed, least);
+        {
+            uint256 least = minSeed(chip, quote.coinsPerUsd);
+            if (seed < least) revert SeedTooSmall(seed, least);
+        }
         (bytes32 ticker, address anchor, address source) = registry.resolve(chip);
         house = vault.createHouse(ticker, chip);
+        _seed(house, chip, seed, owner, ticker, anchor, source);
+    }
 
+    /// @dev Pulls the seed from the caller and deposits it into the new house, locked for `owner`.
+    function _seed(
+        bytes32 house,
+        address chip,
+        uint256 seed,
+        address owner,
+        bytes32 ticker,
+        address anchor,
+        address source
+    ) private {
         SafeTransferLib.safeTransferFrom(chip, msg.sender, address(this), seed);
         SafeTransferLib.safeApprove(chip, address(vault), seed);
         uint64 until = uint64(block.timestamp) + lockTime;

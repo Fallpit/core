@@ -10,6 +10,7 @@ import {MockChip} from "../hook/mocks/MockChips.sol";
 import {MockFeesManager} from "../vault/mocks/MockFeesManager.sol";
 import {Ticket, ticketsOf, ticketOf} from "../Ticket.sol";
 import {PitVault} from "../../src/PitVault.sol";
+import {PitOracle} from "../../src/PitOracle.sol";
 import {IFallpitHook, RefundReason} from "../../src/interfaces/IFallpitHook.sol";
 import {IFallpitRouter} from "../../src/interfaces/IFallpitRouter.sol";
 import {IPitBook} from "../../src/hook/IPitBook.sol";
@@ -129,12 +130,14 @@ contract LifecycleTest is IntegrationFixture {
         // everybody collects everything from both days
         vm.prank(alice);
         router.redeem(tuesdayToken.id, 6_000e18);
-        Ticket memory carolsToken = ticketsOf(hook, tuesday)[F4];
-        Ticket memory alicesToken = ticketsOf(hook, wednesday)[LOWER];
-        vm.prank(carol);
-        router.redeem(carolsToken.id, 8_000e18);
-        vm.prank(alice);
-        router.redeem(alicesToken.id, 9_000e18);
+        {
+            Ticket memory carolsToken = ticketsOf(hook, tuesday)[F4];
+            Ticket memory alicesToken = ticketsOf(hook, wednesday)[LOWER];
+            vm.prank(carol);
+            router.redeem(carolsToken.id, 8_000e18);
+            vm.prank(alice);
+            router.redeem(alicesToken.id, 9_000e18);
+        }
         hook.collectProtocolFees(address(chip));
         vm.startPrank(lp);
         vault.requestWithdraw(house, vault.balanceOf(lp, uint256(house)));
@@ -148,9 +151,11 @@ contract LifecycleTest is IntegrationFixture {
         vm.stopPrank();
 
         // bob's losing Tuesday tokens are the only supply left, worth nothing; every chip is accounted for
-        (uint256 claims, uint256 owed) = Accounting.read(address(hook), address(chip));
-        assertEq(claims, 0);
-        assertEq(owed, 0);
+        {
+            (uint256 claims, uint256 owed) = Accounting.read(address(hook), address(chip));
+            assertEq(claims, 0);
+            assertEq(owed, 0);
+        }
         assertEq(chip.balanceOf(address(hook)), 0);
         assertEq(chip.balanceOf(address(router)), 0);
         assertEq(
@@ -237,6 +242,7 @@ contract LifecycleTest is IntegrationFixture {
     // --------------------------------------------------------------------------------------------
 
     function test_void_noCloseFor24Hours_refundsCostAndReturnsTheHouse() public {
+        _useKeeperClosedTicker();
         _open();
         uint256 aliceCost = _buy(alice, HIGHER, 10_000e18, S0);
         uint256 bobCost = _buy(bob, F5, 6_000e18, S0 * 1001 / 1000);
@@ -258,7 +264,7 @@ contract LifecycleTest is IntegrationFixture {
 
         IFallpitHook.RoundState memory voided = _state();
         assertEq(uint8(voided.status), uint8(IFallpitHook.Status.Void));
-        (, uint256[12] memory premium) = hook.getSupplies(roundId);
+        (, uint256[15] memory premium) = hook.getSupplies(roundId);
         assertEq(voided.payoutOwed, premium[HIGHER] + premium[F5]);
         assertEq(premium[F5], bobCost, "bob's whole cost, fees included, is his refund");
         assertLe(premium[HIGHER], aliceCost - aliceBack, "alice's refund is at most her net cash in");
@@ -291,14 +297,14 @@ contract LifecycleTest is IntegrationFixture {
         // and the void by the 24 hour rule comes after Wednesday's cutoff, so the
         // house sat out Wednesday. Thursday's round waits for Wednesday's close, which is not missed yet.
         vm.expectRevert(IFallpitHook.TooLate.selector);
-        hook.openRound(NVDA, address(chip), day + 1);
+        hook.openRound(ticker, address(chip), day + 1);
         vm.expectRevert(IPitBook.NotNextTradingDay.selector);
-        hook.openRound(NVDA, address(chip), day + 2);
+        hook.openRound(ticker, address(chip), day + 2);
         day += 1;
         uint256 wednesdayClose = _grid(S0 * 1004 / 1000);
         _recordClose(wednesdayClose, KEEPER_SOURCE);
         day += 1;
-        roundId = hook.openRound(NVDA, address(chip), day);
+        roundId = hook.openRound(ticker, address(chip), day);
         assertEq(hook.getConfig(roundId).capital, houseBack);
         assertEq(hook.getConfig(roundId).s0, wednesdayClose, "from the newest close on the books");
     }
@@ -306,6 +312,7 @@ contract LifecycleTest is IntegrationFixture {
     /// @dev The guardian cannot void: it can only dispute a keeper close in the window,
     ///      which holds the rounds on it open for a correction until one hour after the close.
     function test_guardian_disputesOnlyInTheChallengeWindowOfAKeeperClose_neverVoids() public {
+        _useKeeperClosedTicker();
         _open();
         _buy(alice, HIGHER, 10_000e18, S0);
         _recordClose(S0 * 101 / 100, KEEPER_SOURCE);
@@ -325,7 +332,7 @@ contract LifecycleTest is IntegrationFixture {
         book.dispute(roundId);
         // nobody voids a settled round, the guardian included
         vm.prank(guardian);
-        vm.expectRevert(IFallpitHook.WrongStatus.selector);
+        vm.expectRevert(IFallpitHook.VoidNotAllowed.selector);
         hook.voidRound(house, day);
 
         uint256 snapshot = vm.snapshotState();
@@ -361,7 +368,7 @@ contract LifecycleTest is IntegrationFixture {
         _recordClose(S0 * 101 / 100, PYTH_SOURCE);
         hook.settleRound(house, day);
         vm.prank(guardian);
-        vm.expectRevert(IFallpitHook.WrongStatus.selector);
+        vm.expectRevert(IFallpitHook.VoidNotAllowed.selector);
         hook.voidRound(house, day);
         vm.prank(guardian);
         vm.expectRevert(IPitBook.DisputeNotAllowed.selector);
@@ -369,14 +376,52 @@ contract LifecycleTest is IntegrationFixture {
         // not even after the 24 hours that would void a round without a close
         _warp(NYTime.closeTs(day) + 24 hours + 1);
         vm.prank(guardian);
-        vm.expectRevert(IFallpitHook.WrongStatus.selector);
+        vm.expectRevert(IFallpitHook.VoidNotAllowed.selector);
         hook.voidRound(house, day);
         hook.finalizeRound(house, day);
         assertEq(uint8(_state().status), uint8(IFallpitHook.Status.Final));
     }
 
     /// @dev A recorded close blocks the permissionless 24 hour void of a round nobody settled yet.
+    /// @dev A split between the round's starting close and its close (the stock token's multiplier
+    ///      changed): the round cannot settle on a price the market did not make; anyone voids it at once,
+    ///      and the next open of the house voids it too.
+    function test_corporateAction_voidsTheRoundInsteadOfSettling() public {
+        _open();
+        _buy(alice, HIGHER, 10_000e18, S0);
+        _buy(bob, LOWER, 10_000e18, S0);
+        // a 10:1 split takes effect before the close: the price is a tenth, the multiplier ten
+        vm.prank(keeper);
+        stockTokenOf[NVDA].setMultiplier(10e18);
+        _recordClose(S0 / 10, PYTH_SOURCE);
+        vm.expectRevert(IFallpitHook.CorporateAction.selector);
+        hook.settleRound(house, day);
+        uint256 bobBefore = chip.balanceOf(bob);
+        hook.voidRound(house, day);
+        assertEq(uint8(_state().status), uint8(IFallpitHook.Status.Void));
+        // LOWER would have won on the split price; on the void each holder gets at most its cost back
+        uint256 lowerId = _token(LOWER).id;
+        vm.prank(bob);
+        uint256 back = router.redeem(lowerId, 10_000e18);
+        assertLt(back, 10_000e18, "no win on the split price");
+        assertEq(chip.balanceOf(bob), bobBefore + back);
+    }
+
+    /// @dev The same round left open is voided by the house's next open.
+    function test_corporateAction_theNextOpenVoidsTheRound() public {
+        _open();
+        _buy(alice, HIGHER, 10_000e18, S0);
+        bytes32 first = roundId;
+        vm.prank(keeper);
+        stockTokenOf[NVDA].setMultiplier(10e18);
+        _recordClose(S0 / 10, PYTH_SOURCE);
+        day = day + 1; // Wednesday
+        hook.openRound(NVDA, address(chip), day);
+        assertEq(uint8(hook.getState(first).status), uint8(IFallpitHook.Status.Void));
+    }
+
     function test_void_notOnceACloseIsRecorded_evenUnsettled() public {
+        _useKeeperClosedTicker();
         _open();
         _buy(alice, HIGHER, 10_000e18, S0);
         _recordClose(S0 * 101 / 100, KEEPER_SOURCE);
@@ -402,7 +447,7 @@ contract LifecycleTest is IntegrationFixture {
         router.refund(sellId);
         assertEq(chip.balanceOf(bob), STAKE);
         assertEq(_token(HIGHER).balanceOf(alice), 10_000e18, "the escrowed tokens are back and still redeem");
-        (, uint256[12] memory premium) = hook.getSupplies(roundId);
+        (, uint256[15] memory premium) = hook.getSupplies(roundId);
         uint256 token2_6 = _token(HIGHER).id;
         vm.prank(alice);
         assertEq(router.redeem(token2_6, 10_000e18), premium[HIGHER]);
@@ -453,27 +498,24 @@ contract LifecycleTest is IntegrationFixture {
         assertEq(STAKE - chip.balanceOf(alice), quoted, "filled at the Pyth price");
     }
 
-    function test_fillSource_doesNotPinTheClose_trustlessReplacesKeeper() public {
+    /// @dev One close source per ticker: a ticker with a Pyth feed (TSLA here) closes on Pyth only, so no
+    ///      keeper close can be recorded and later replaced by whoever the Pyth number favours.
+    function test_closeSource_aTickerWithAPythFeed_closesOnPythOnly() public {
         _use(TSLA, address(chip));
         _lpDeposit(lp, house, HOUSE_CAPITAL);
         _open();
         _buy(alice, HIGHER, 10_000e18, TSLA_S0); // HIGHER at the previous close
         _buy(bob, LOWER, 10_000e18, TSLA_S0); // LOWER at the previous close
 
-        // the keeper records the close first, just above the strike: alice wins
-        _recordClose(TSLA_S0 * 1001 / 1000, KEEPER_SOURCE);
-        hook.settleRound(house, day);
-        assertEq(_state().winners >> HIGHER & 1, 1, "HIGHER wins on the keeper's close");
-        // a second keeper print cannot replace it
+        // a keeper print is refused as the close
         uint64 closeAt = NYTime.closeTs(day);
-        bytes memory other = _signedPrint(TSLA, _grid(TSLA_S0 * 1002 / 1000), closeAt, closeAt - 1);
-        vm.expectRevert(IPitBook.ReplacementRefused.selector);
+        _warp(closeAt + 5);
+        bytes memory other = _signedPrint(TSLA, _grid(TSLA_S0 * 1001 / 1000), closeAt, closeAt - 1);
+        vm.expectRevert(abi.encodeWithSelector(PitOracle.KeeperCloseRefused.selector, TSLA));
         book.recordClose(TSLA, day, other);
 
-        // the Pyth print for 16:00:00 says just below the strike: it replaces the keeper's close
+        // the Pyth print for 16:00:00 says just below the strike: LOWER wins
         _recordClose(TSLA_S0 * 9995 / 10_000, PYTH_SOURCE);
-        vm.expectRevert(IFallpitHook.CloseChanged.selector);
-        hook.finalizeRound(house, day);
         hook.settleRound(house, day);
         assertEq(_state().winners >> LOWER & 1, 1, "LOWER wins on the trustless close");
         assertEq(_state().winners >> HIGHER & 1, 0);

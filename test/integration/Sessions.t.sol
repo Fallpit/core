@@ -250,6 +250,17 @@ contract SessionsTest is IntegrationFixture {
         bytes memory gsig = _sig(samKey, router.grantDigest(g));
         vm.expectRevert(IFallpitRouter.GrantUsed.selector);
         router.grantSession(g, gsig);
+        // another grant for the same key and nonce, signed before the revocation (a later expiry), is
+        // refused too: it would restart the revoked session
+        IFallpitRouter.SessionGrant memory other = g;
+        other.expiry = g.expiry + 1 hours;
+        bytes memory osig = _sig(samKey, router.grantDigest(other));
+        vm.expectRevert(IFallpitRouter.StaleNonce.selector);
+        router.grantSession(other, osig);
+        // after the user bumps the nonce, a new grant for the key works
+        vm.prank(sam);
+        router.bumpSessionNonce();
+        _grant(sam, samKey, clock + 1 days, STAKE);
     }
 
     function test_session_nonceBump_endsEverySession() public {

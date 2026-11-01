@@ -168,6 +168,8 @@ contract PitVault is IPitVault, ReentrancyGuardTransient {
     error ChipNotAllowed();
     error TickerNotSupported();
     error HouseLocked();
+    /// @notice A lock above 2^128 shares (it would not fit its slot).
+    error LockTooLarge();
     error HouseNotLocked();
     error ZeroAmount();
     error ZeroShares();
@@ -256,6 +258,7 @@ contract PitVault is IPitVault, ReentrancyGuardTransient {
         Lock storage l = _locks[house][owner];
         uint256 total = shares + (l.until > block.timestamp && l.generation == h.generation ? l.shares : 0);
         uint64 end = until > l.until ? until : l.until;
+        if (total > type(uint128).max) revert LockTooLarge();
         _locks[house][owner] = Lock(uint128(total), end, h.generation);
         emit SharesLocked(house, owner, total, end);
     }

@@ -6,6 +6,7 @@ import {IPitOracle} from "./interfaces/IPitOracle.sol";
 import {IPyth} from "./oracle/IPyth.sol";
 import {IChainlinkFeed} from "./oracle/IChainlinkFeed.sol";
 import {IStockToken} from "./oracle/IStockToken.sol";
+import {NYTime} from "./lib/NYTime.sol";
 
 /// @title PitOracle
 /// @notice Free price verification for stock tickers. See contracts/SPEC.md section 4.
@@ -32,11 +33,15 @@ import {IStockToken} from "./oracle/IStockToken.sol";
 ///      is set already, including the fill-in of a missing source, and switching a source off for closes)
 ///      waits `SIGNER_DELAY` (24 hours on mainnet, zero on a testnet) before it takes effect, in the open,
 ///      and can be cancelled. A source switched off for closes refuses only the closes whose instant is
-///      `SIGNER_DELAY` or more after the switch: a weekday round opens at most a day before its close, so
-///      a switch made after it opened never reaches its close, whenever that close is recorded; and no
-///      switch reaches a close whose result is known. Immediate are only: the first configuration of a
-///      ticker (nothing verifies for it before), switching a source back on, and the emergency brake: a
-///      source switched off stops verifying fills (`verifyAt`) at once. The brake never reaches
+///      `SIGNER_DELAY` or more after the switch, so the switch is made before any result it reaches is
+///      known. A round whose close is more than `SIGNER_DELAY` after its open (a Monday round opens on
+///      Friday, a round after a holiday earlier still) can lose its close to a switch made while it is
+///      open; it then voids, which the owner chose before its result. Switching a source back on cannot
+///      undo that choice: the closes from its first refused instant to `SIGNER_DELAY` after the switch
+///      back on stay refused (`closeGap`). So no switch reaches a close whose result is known. Immediate
+///      are only: the first configuration of a ticker (nothing verifies for it before), the fills of a
+///      source switched back on, and the emergency brake: a source switched off (or paused,
+///      `setFillsPaused`) stops verifying fills (`verifyAt`) at once. The brake never reaches
 ///      `verifyCloseAt`, so it cannot stop or pick a close; a stopped fill is never final, and its commit
 ///      is refunded when its window ends. The signer set and the threshold given at construction are in
 ///      force at once.
@@ -159,11 +164,43 @@ contract PitOracle is IPitOracle, Ownable {
 
     mapping(bytes32 ticker => TickerState) internal _state;
 
+    /// @dev Close instants a source refuses although it is on again: `[from, to)`. Written when a source that
+    ///      was off for closes is switched back on, so that switching it on cannot reach a close whose result
+    ///      was known while it was off (the closes from its first refused instant to `SIGNER_DELAY` after the
+    ///      switch back on stay refused).
+    struct CloseGap {
+        uint64 from;
+        uint64 to;
+    }
+
+    /// @dev Slots for the gaps of one source. Each gap needs a switch off and a switch back on at least
+    ///      `SIGNER_DELAY` later (24 hours on mainnet), and a gap lives `GAP_LIFE` after its end, so at most
+    ///      five are live at once on mainnet. If every slot is still live, the new gap merges with the latest
+    ///      one: that refuses more closes, never fewer.
+    uint256 internal constant GAP_SLOTS = 8;
+    /// @dev How long a gap lives after its end: the book's `CLOSE_RECORD_WINDOW`.
+    uint64 internal constant GAP_LIFE = 3 days;
+
+    /// @dev The gaps a source keeps, each `[from, to)`. A new gap merges with any live gap it overlaps or
+    ///      touches and takes a free slot otherwise, so it never covers time when the source was on. A gap
+    ///      is dropped `GAP_LIFE` after its end: by then no close inside it can be recorded except by the
+    ///      owner's late path, and a close first recorded that late settles no round (`PitBook.MISSED_CLOSE`).
+    mapping(bytes32 ticker => mapping(uint8 source => CloseGap[GAP_SLOTS])) internal _gaps;
+
+    /// @dev New York seconds into the day from which a stock token change may take effect (04:00, the end of
+    ///      the 12-hour missed-close window of the 16:00 close) and until which (15:30).
+    uint256 internal constant CLEAR_FROM = 4 hours;
+    uint256 internal constant CLEAR_UNTIL = 15 hours + 30 minutes;
+
     /// @notice A configuration that is in force from now on.
     event TickerSet(bytes32 indexed ticker, TickerConfig config);
     /// @notice A configuration change that takes effect at `activeFrom`.
     event TickerChangeScheduled(bytes32 indexed ticker, TickerConfig config, uint64 activeFrom);
     event TickerChangeCancelled(bytes32 indexed ticker);
+    /// @notice Closes of instants in `[from, to)` stay refused although the source is on again.
+    event CloseGapSet(bytes32 indexed ticker, uint8 indexed source, uint64 from, uint64 to);
+    /// @notice The fill brake of a source, alone (`setFillsPaused`).
+    event FillsPausedSet(bytes32 indexed ticker, uint8 indexed source, bool paused);
     /// @param closesOffFrom the first close instant the source refuses (0 when it was switched back on)
     event SourceDisabledSet(
         bytes32 indexed ticker, uint8 indexed source, bool disabled, uint64 closesOffFrom
@@ -178,6 +215,8 @@ contract PitOracle is IPitOracle, Ownable {
     error UnsupportedTicker(bytes32 ticker);
     error SourceNotConfigured(bytes32 ticker, uint8 source);
     error SourceIsDisabled(bytes32 ticker, uint8 source);
+    /// @notice A keeper print offered as the close of a ticker that has a Pyth feed (it closes on Pyth only).
+    error KeeperCloseRefused(bytes32 ticker);
     error SourcePinned();
     error NoPendingChange();
     error InvalidConfig();
@@ -389,10 +428,26 @@ contract PitOracle is IPitOracle, Ownable {
             emit TickerSet(ticker, c);
         } else {
             uint64 from = uint64(block.timestamp) + SIGNER_DELAY;
+            // a stock token added later changes the multiplier the book stores with each close, and a Pyth
+            // feed added later changes which source may record a close: either takes effect only outside the
+            // close hours, so whoever records a close cannot pick the multiplier or the source by recording
+            // it before or after the change
+            if (c.stockToken != old.stockToken || c.pythFeedId != old.pythFeedId) from = clearOfCloses(from);
             _pendingConfig[ticker] = c;
             st.configFrom = from;
             emit TickerChangeScheduled(ticker, c, from);
         }
+    }
+
+    /// @notice `t`, or the next 04:00 New York when `t` falls from 15:30 to 04:00 New York: the hours in which
+    ///         a close (16:00) can still be recorded and settle (`PitBook.MISSED_CLOSE`, 12 hours) or is
+    ///         about to be made.
+    function clearOfCloses(uint64 t) public pure returns (uint64) {
+        uint32 day = uint32(t / 1 days);
+        if (t < NYTime.midnight(day)) --day;
+        if (t < NYTime.at(day, CLEAR_FROM)) return NYTime.at(day, CLEAR_FROM);
+        if (t >= NYTime.at(day, CLEAR_UNTIL)) return NYTime.at(day + 1, CLEAR_FROM);
+        return t;
     }
 
     /// @notice Drops the configuration change of `ticker` that is still waiting.
@@ -405,25 +460,113 @@ contract PitOracle is IPitOracle, Ownable {
         emit TickerChangeCancelled(ticker);
     }
 
-    /// @notice Switches a source (0x01 Pyth, 0x02 keeper) of `ticker` off or back on. Off: the source
-    ///         verifies no fill from now on and does not count towards `supported`, and it verifies no close
-    ///         for an instant `SIGNER_DELAY` or more from now (`closesOffFrom`; on a testnet, with no delay,
-    ///         no close at all). The close of a round that is open now is still verified. Back on: at once,
-    ///         for fills and closes. Switching off a source that is off already keeps its first close instant.
+    /// @notice Switches a source (0x01 Pyth, 0x02 keeper) of `ticker` off or back on, for fills and closes.
+    ///         Off: the source verifies no fill from now on and does not count towards `supported`, and it
+    ///         verifies no close for an instant `SIGNER_DELAY` or more from now (`closesOffFrom`; on a
+    ///         testnet, with no delay, no close at all). The close of a round that is open now is still
+    ///         verified. Switching off a source that is off already keeps its first close instant.
+    ///         Back on: fills at once. Closes: if no close instant was refused yet (the switch back on comes
+    ///         before `closesOffFrom`), at once. Otherwise the closes from `closesOffFrom` to `SIGNER_DELAY`
+    ///         after the switch back on stay refused (`closeGap`): an owner who sees a result while a source
+    ///         is off cannot turn it on to have that close recorded. A new gap merges with a live gap only
+    ///         when the two overlap or touch, and is kept apart otherwise, so a gap never covers time when
+    ///         the source was on, a second off and on never frees a close an earlier gap refused, and the
+    ///         switch is never blocked. On a testnet (no delay) there is no gap.
     function setSourceDisabled(bytes32 ticker, uint8 source, bool disabled) external onlyOwner {
         if (source != SOURCE_PYTH && source != SOURCE_KEEPER) revert UnknownSource(source);
         TickerState storage st = _state[ticker];
         (, uint64 from) = _switchOf(st, source);
-        if (!disabled) from = 0;
-        else if (from == 0) from = SIGNER_DELAY == 0 ? 1 : uint64(block.timestamp) + SIGNER_DELAY;
-        if (source == SOURCE_PYTH) {
-            st.pythOff = disabled;
-            st.pythCloseOffFrom = from;
-        } else {
-            st.keeperOff = disabled;
-            st.keeperCloseOffFrom = from;
+        if (disabled) {
+            if (from == 0) from = SIGNER_DELAY == 0 ? 1 : uint64(block.timestamp) + SIGNER_DELAY;
+        } else if (from != 0) {
+            if (SIGNER_DELAY != 0 && block.timestamp >= from) {
+                _addGap(ticker, source, from, uint64(block.timestamp) + SIGNER_DELAY);
+            }
+            from = 0;
         }
+        _setSwitch(st, source, disabled, from);
         emit SourceDisabledSet(ticker, source, disabled, from);
+    }
+
+    /// @notice The brake alone: stops (or restarts) the fills a source verifies for `ticker`, at once, and
+    ///         changes nothing for closes.
+    function setFillsPaused(bytes32 ticker, uint8 source, bool paused) external onlyOwner {
+        if (source != SOURCE_PYTH && source != SOURCE_KEEPER) revert UnknownSource(source);
+        TickerState storage st = _state[ticker];
+        (, uint64 from) = _switchOf(st, source);
+        _setSwitch(st, source, paused, from);
+        emit FillsPausedSet(ticker, source, paused);
+    }
+
+    /// @notice The latest live gap of a source of `ticker`: close instants `[from, to)` it refuses although it
+    ///         is on (zeros: none). `closeGaps` lists them all.
+    function closeGap(bytes32 ticker, uint8 source) external view returns (uint64 from, uint64 to) {
+        CloseGap[GAP_SLOTS] storage gaps = _gaps[ticker][source];
+        for (uint256 i; i < GAP_SLOTS; ++i) {
+            CloseGap memory g = gaps[i];
+            if (_live(g) && g.to > to) (from, to) = (g.from, g.to);
+        }
+    }
+
+    /// @notice Every live gap of a source of `ticker`, slot by slot (zeros: an empty slot).
+    function closeGaps(bytes32 ticker, uint8 source)
+        external
+        view
+        returns (uint64[GAP_SLOTS] memory from, uint64[GAP_SLOTS] memory to)
+    {
+        CloseGap[GAP_SLOTS] storage gaps = _gaps[ticker][source];
+        for (uint256 i; i < GAP_SLOTS; ++i) {
+            CloseGap memory g = gaps[i];
+            if (_live(g)) (from[i], to[i]) = (g.from, g.to);
+        }
+    }
+
+    /// @dev Stores the gap `[gFrom, gTo)`: merged with every live gap it overlaps or touches (repeated, since a
+    ///      merge can reach another gap), else in a free slot (empty or past `GAP_LIFE`), else merged with the
+    ///      latest gap.
+    function _addGap(bytes32 ticker, uint8 source, uint64 gFrom, uint64 gTo) private {
+        CloseGap[GAP_SLOTS] storage gaps = _gaps[ticker][source];
+        bool merged = true;
+        while (merged) {
+            merged = false;
+            for (uint256 i; i < GAP_SLOTS; ++i) {
+                CloseGap memory g = gaps[i];
+                if (!_live(g) || g.from > gTo || gFrom > g.to) continue;
+                if (g.from < gFrom) gFrom = g.from;
+                if (g.to > gTo) gTo = g.to;
+                delete gaps[i];
+                merged = true;
+            }
+        }
+        uint256 slot = GAP_SLOTS;
+        uint256 latest;
+        for (uint256 i; i < GAP_SLOTS; ++i) {
+            CloseGap memory g = gaps[i];
+            if (!_live(g)) {
+                slot = i;
+                break;
+            }
+            if (g.to > gaps[latest].to) latest = i;
+        }
+        if (slot == GAP_SLOTS) {
+            // every slot is live (not reachable with a 24-hour delay): merge with the latest gap, which only
+            // refuses more closes
+            slot = latest;
+            if (gaps[slot].from < gFrom) gFrom = gaps[slot].from;
+            if (gaps[slot].to > gTo) gTo = gaps[slot].to;
+        }
+        gaps[slot] = CloseGap(gFrom, gTo);
+        emit CloseGapSet(ticker, source, gFrom, gTo);
+    }
+
+    function _setSwitch(TickerState storage st, uint8 source, bool off, uint64 closeFrom) internal {
+        if (source == SOURCE_PYTH) {
+            st.pythOff = off;
+            st.pythCloseOffFrom = closeFrom;
+        } else {
+            st.keeperOff = off;
+            st.keeperCloseOffFrom = closeFrom;
+        }
     }
 
     /// @notice Schedules a new signer set and threshold. They take effect `SIGNER_DELAY` from now; until
@@ -459,16 +602,28 @@ contract PitOracle is IPitOracle, Ownable {
         returns (uint256 priceWad, uint64 ts, bool trustless)
     {
         if (report.length < 2) revert MalformedReport();
-        TickerState memory st = _state[ticker];
-        TickerConfig memory cfg = _inForce(ticker, st);
-        if (st.configFrom != 0 && block.timestamp >= st.configFrom) _promoteConfig(ticker);
-        // a fill is checked against the fill switches; a close against the close switches at its instant
-        uint64 closeAt = close ? t : 0;
-        if (!_supported(st, cfg, closeAt)) revert UnsupportedTicker(ticker);
-        uint32 lag = close ? cfg.closeMaxLag : cfg.maxLag;
+        TickerConfig memory cfg;
+        uint32 lag;
+        uint8 source;
+        {
+            TickerState memory st = _state[ticker];
+            cfg = _inForce(ticker, st);
+            if (st.configFrom != 0 && block.timestamp >= st.configFrom) _promoteConfig(ticker);
+            // a fill is checked against the fill switches; a close against the close switches at its instant
+            uint64 closeAt = close ? t : 0;
+            if (!_supported(st, cfg, closeAt)) revert UnsupportedTicker(ticker);
+            lag = close ? cfg.closeMaxLag : cfg.maxLag;
 
-        uint8 source = uint8(report[0]);
-        if (_isOff(st, source, closeAt)) revert SourceIsDisabled(ticker, source);
+            source = uint8(report[0]);
+            if (_isOff(st, source, closeAt) || (close && _inGap(ticker, source, t))) {
+                revert SourceIsDisabled(ticker, source);
+            }
+            // one close source per ticker, so nobody can pick between two closes of one instant: a ticker
+            // with a Pyth feed closes on Pyth only; the keeper's print closes only a ticker without one
+            if (close && source == SOURCE_KEEPER && cfg.pythFeedId != bytes32(0)) {
+                revert KeeperCloseRefused(ticker);
+            }
+        }
         uint256 spent;
         if (source == SOURCE_PYTH) {
             (priceWad, ts, spent) = _verifyPyth(ticker, cfg, t, lag, report[1:]);
@@ -556,6 +711,21 @@ contract PitOracle is IPitOracle, Ownable {
         return closeAt != 0 ? from != 0 && closeAt >= from : off;
     }
 
+    /// @dev True when the close of instant `t` falls in a source's close gap.
+    function _inGap(bytes32 ticker, uint8 source, uint64 t) internal view returns (bool) {
+        CloseGap[GAP_SLOTS] storage gaps = _gaps[ticker][source];
+        for (uint256 i; i < GAP_SLOTS; ++i) {
+            CloseGap memory g = gaps[i];
+            if (_live(g) && t >= g.from && t < g.to) return true;
+        }
+        return false;
+    }
+
+    /// @dev A gap that is set and not yet `GAP_LIFE` past its end.
+    function _live(CloseGap memory g) internal view returns (bool) {
+        return g.to != 0 && block.timestamp < uint256(g.to) + GAP_LIFE;
+    }
+
     /// @dev The configuration of `ticker` in force now.
     function _inForce(bytes32 ticker, TickerState memory st) internal view returns (TickerConfig memory) {
         uint64 from = st.configFrom;
@@ -579,19 +749,8 @@ contract PitOracle is IPitOracle, Ownable {
     {
         if (cfg.pythFeedId == bytes32(0)) revert SourceNotConfigured(ticker, SOURCE_PYTH);
 
-        bytes[] memory updateData = new bytes[](1);
-        updateData[0] = blob;
-        bytes32[] memory ids = new bytes32[](1);
-        ids[0] = cfg.pythFeedId;
-
-        fee = pyth.getUpdateFee(updateData);
-        if (msg.value < fee) revert InsufficientFee(fee, msg.value);
-        IPyth.PriceFeed[] memory feeds =
-            pyth.parsePriceFeedUpdatesUnique{value: fee}(updateData, ids, t, t + lag);
-
-        if (feeds.length != 1) revert MalformedReport();
-        if (feeds[0].id != cfg.pythFeedId) revert WrongFeed(feeds[0].id);
-        IPyth.Price memory p = feeds[0].price;
+        IPyth.Price memory p;
+        (p, fee) = _parsePyth(cfg.pythFeedId, t, lag, blob);
         // Pyth checked the window; checking it again costs nothing and does not rely on the core contract.
         if (p.publishTime < t || p.publishTime > uint256(t) + lag) {
             revert NotThePrintForT(t, 0, uint64(p.publishTime));
@@ -603,6 +762,26 @@ contract PitOracle is IPitOracle, Ownable {
 
         priceWad = price * 10 ** uint256(uint32(18 + p.expo));
         ts = uint64(p.publishTime);
+    }
+
+    /// @dev Pays Pyth's fee and parses the one update in `blob` for `feedId` in the window `[t, t + lag]`.
+    function _parsePyth(bytes32 feedId, uint64 t, uint32 lag, bytes calldata blob)
+        private
+        returns (IPyth.Price memory p, uint256 fee)
+    {
+        bytes[] memory updateData = new bytes[](1);
+        updateData[0] = blob;
+        bytes32[] memory ids = new bytes32[](1);
+        ids[0] = feedId;
+
+        fee = pyth.getUpdateFee(updateData);
+        if (msg.value < fee) revert InsufficientFee(fee, msg.value);
+        IPyth.PriceFeed[] memory feeds =
+            pyth.parsePriceFeedUpdatesUnique{value: fee}(updateData, ids, t, t + lag);
+
+        if (feeds.length != 1) revert MalformedReport();
+        if (feeds[0].id != feedId) revert WrongFeed(feeds[0].id);
+        p = feeds[0].price;
     }
 
     /// @dev Source 0x02. `data` is `abi.encode(Print, bytes[] signatures)`.

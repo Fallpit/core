@@ -266,24 +266,25 @@ contract DirectoryTest is IntegrationFixture {
     }
 
     function test_nextOpenableDay_pastTheCutoff_waitsForTheClose() public {
+        _useKeeperClosedTicker();
         _warp(NYTime.closeTs(day) - 600); // 15:50, past the 15:49:30 cutoff, nothing opened today
-        (uint32 d, uint64 openTs, uint64 closeTs, bool openable) = _next(NVDA);
+        (uint32 d, uint64 openTs, uint64 closeTs, bool openable) = _next(ticker);
         assertEq(d, day + 1, "Wednesday");
         assertEq(openTs, NYTime.closeTs(day), "once Tuesday's close is in");
         assertEq(closeTs, NYTime.closeTs(day + 1));
         assertFalse(openable);
         vm.expectRevert(IFallpitHook.TooLate.selector);
-        hook.openRound(NVDA, address(chip), day);
+        hook.openRound(ticker, address(chip), day);
         vm.expectRevert(IPitBook.NotNextTradingDay.selector);
-        hook.openRound(NVDA, address(chip), day + 1);
+        hook.openRound(ticker, address(chip), day + 1);
 
         // Tuesday's close: Wednesday opens
         _recordClose(S0, KEEPER_SOURCE);
-        (d, openTs,, openable) = _next(NVDA);
+        (d, openTs,, openable) = _next(ticker);
         assertEq(d, day + 1);
         assertEq(openTs, NYTime.closeTs(day));
         assertTrue(openable);
-        hook.openRound(NVDA, address(chip), d);
+        hook.openRound(ticker, address(chip), d);
     }
 
     function test_nextOpenableDay_aMissedClose_opensTheDayAfter() public {

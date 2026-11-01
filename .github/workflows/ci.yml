@@ -16,7 +16,7 @@ jobs:
   test:
     name: Build and test
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
         with:
@@ -29,15 +29,6 @@ jobs:
       - name: Format
         run: forge fmt --check
 
-      # via_ir compiles are memory heavy: the runner has no swap, and systemd-oomd stops the build
-      - name: Add swap
-        run: |
-          sudo systemctl stop systemd-oomd || true
-          sudo swapoff -a || true
-          sudo fallocate -l 16G /swapfile2 && sudo chmod 600 /swapfile2
-          sudo mkswap /swapfile2 && sudo swapon /swapfile2
-          free -h
-
       - uses: actions/cache@v4
         with:
           path: |
@@ -47,7 +38,7 @@ jobs:
           restore-keys: forge-
 
       - name: Build and sizes
-        run: forge build --sizes --threads 2
+        run: forge build --sizes
 
       - name: Test
-        run: forge test --threads 2
+        run: forge test

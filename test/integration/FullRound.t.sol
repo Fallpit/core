@@ -71,6 +71,7 @@ contract FullRoundTest is IntegrationFixture {
     // --------------------------------------------------------------------------------------------
 
     function test_fullRound_keeperPath_cashConservation() public {
+        _useKeeperClosedTicker();
         _fund(alice, STAKE);
         _fund(bob, STAKE);
         _fund(carol, STAKE);
@@ -86,7 +87,7 @@ contract FullRoundTest is IntegrationFixture {
         _tradeTheMenu(S0);
         _assertSupplies();
         _assertHookSolvent(address(chip));
-        (uint256[12] memory supply,) = hook.getSupplies(roundId);
+        (uint256[15] memory supply,) = hook.getSupplies(roundId);
         IFallpitHook.RoundState memory open = _state();
         assertGt(open.protocolFees, 0);
         assertEq(chip.balanceOf(address(hook)), open.held, "every chip of the round sits in the hook");
@@ -160,7 +161,7 @@ contract FullRoundTest is IntegrationFixture {
         _tradeTheMenu(TSLA_S0);
         _assertSupplies();
         _assertHookSolvent(address(chip));
-        (uint256[12] memory supply,) = hook.getSupplies(roundId);
+        (uint256[15] memory supply,) = hook.getSupplies(roundId);
         IFallpitHook.RoundState memory open = _state();
 
         // down 2.5%: band 14, so the floor from -2 to -1 sigma wins, and LOWER. (On the three strikes:
@@ -280,7 +281,7 @@ contract FullRoundTest is IntegrationFixture {
 
         _assertSupplies();
         _assertHookSolvent(address(taxChip));
-        (uint256[12] memory supply,) = hook.getSupplies(roundId);
+        (uint256[15] memory supply,) = hook.getSupplies(roundId);
         IFallpitHook.RoundState memory open = _state();
         assertGe(taxChip.balanceOf(address(hook)), open.held, "the hook holds at least what the round books");
         assertEq(taxChip.balanceOf(address(router)), 0, "no escrow left behind");

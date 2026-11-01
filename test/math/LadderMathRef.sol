@@ -239,6 +239,33 @@ contract LadderMathRef is ILadderMath {
         return _quote(w, bk, _solve(w, bk, COLD)).p;
     }
 
+    error NotInReference();
+
+    /// @dev Not part of the reference: the packed form only changes how the state and the depths travel.
+    ///      `LadderMathPackedTest` checks `LadderMath.fillPacked` against `depths` followed by `fillFrom`.
+    function fillPacked(PackedIn calldata, Ctx calldata, uint8, uint8, int256, int256)
+        external
+        pure
+        returns (PackedFill memory)
+    {
+        revert NotInReference();
+    }
+
+    /// @dev The reference solves from cold: the seed is ignored and no root is handed back.
+    function fillFrom(
+        int256[40] calldata v,
+        uint256[40] calldata b0,
+        uint256 sigma,
+        Ctx calldata ctx,
+        uint8 lo,
+        uint8 hi,
+        int256 delta,
+        int256
+    ) external pure returns (Fill memory f, int256 lambda) {
+        f = fill(v, b0, sigma, ctx, lo, hi, delta);
+        lambda = 0;
+    }
+
     /// @inheritdoc ILadderMath
     /// @dev delta == 0 returns amount 0 and the rescaled state. pBefore and pAfter are capped at 1e18.
     ///      vega is rounded up by VEGA_DUST per finite edge of the set.
@@ -250,7 +277,7 @@ contract LadderMathRef is ILadderMath {
         uint8 lo,
         uint8 hi,
         int256 delta
-    ) external pure returns (Fill memory f) {
+    ) public pure returns (Fill memory f) {
         if (lo > hi || hi >= BANDS) revert InvalidSet();
         if (FixedPointMathLib.abs(delta) > MAX_MAGNITUDE) revert InvalidDelta();
         if (ctx.gNew == 0 || ctx.gNew > ctx.gOld || ctx.gOld > WAD) revert InvalidDepthScale();

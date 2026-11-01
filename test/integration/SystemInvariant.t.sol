@@ -18,7 +18,7 @@ import {PitMath} from "../../src/hook/PitMath.sol";
 import {NYTime} from "../../src/lib/NYTime.sol";
 import {Menus} from "../Menus.sol";
 
-/// @notice Drives the whole real system: two houses in one chip (NVDA on keeper-signed prints, TSLA on
+/// @notice Drives the whole real system: two houses in one chip (KONLY on keeper-signed prints and keeper closes, TSLA on
 ///         Pyth), four traders on every product of whatever menu a round has, three LPs who deposit,
 ///         withdraw, cancel and claim at any time, a donor, abandoned commits, and days that roll: closes
 ///         from either source, trustless replacement, the challenge window, guardian voids, days without a
@@ -64,7 +64,6 @@ contract SystemHandler is IntegrationFixture {
     uint256 public voids;
     uint256 public disputes;
     uint256 public keeperCloses;
-    uint256 public replacedCloses;
     uint256 public lpMoves;
     uint256 public houseLosses;
     uint256 public houseWins;
@@ -75,6 +74,8 @@ contract SystemHandler is IntegrationFixture {
     /// @dev Rounds opened on a menu other than the default, and buys refused for a product cap.
     uint256 public otherMenus;
     uint256 public capRefusals;
+    /// @dev Live strikes opened.
+    uint256 public strikes;
 
     /// @dev Number of products of the round the helpers point at.
     function _products() internal view returns (uint8) {
@@ -102,11 +103,14 @@ contract SystemHandler is IntegrationFixture {
     }
 
     function init() external {
-        tickers = [NVDA, TSLA];
+        // a ticker with a Pyth feed closes on Pyth only: the keeper-close paths (challenge window, disputes)
+        // run on KONLY, a stock with no Pyth feed; TSLA closes on Pyth
+        _useKeeperClosedTicker();
+        tickers = [KONLY, TSLA];
         houses[0] = house;
         houses[1] = _createHouse(TSLA, address(chip));
         prices = [S0, TSLA_S0];
-        minted = HOUSE_CAPITAL; // the fixture's LP deposit into the NVDA house
+        minted = HOUSE_CAPITAL; // the fixture's LP deposit (moved to the KONLY house)
         for (uint256 i; i < 4; ++i) {
             traders[i] = address(uint160(0xA11CE000 + i));
             vm.deal(traders[i], TRADER_ETH);
@@ -224,6 +228,34 @@ contract SystemHandler is IntegrationFixture {
         assertGe(g, 0.3e18);
     }
 
+    /// @dev Opens the live strike at the stock's price now. The lens and the hook must agree: when the
+    ///      lens says it may open, it opens; when not, the hook refuses it for one of the strike rules.
+    function strike(uint256 houseSeed, uint256 dt, uint256 drift) external {
+        uint256 h = houseSeed % 2;
+        _tick(h, dt, drift);
+        if (!_select(h)) return;
+        // a print already made for this second (by a fill) carries its own price
+        if (_keeperPrints[ticker][clock].length != 0 || _pythPrints[ticker][clock].length != 0) return;
+        (uint8 m, bool ok) = lens.strikeEdgeAt(roundId, _grid(prices[h]), clock);
+        bytes memory report = _print(clock, prices[h]);
+        if (ok) {
+            hook.openStrike(roundId, m, clock, report);
+            ++strikes;
+            return;
+        }
+        try hook.openStrike(roundId, m, clock, report) {
+            revert("the lens said no");
+        } catch (bytes memory err) {
+            bytes4 why = bytes4(err);
+            assertTrue(
+                why == IFallpitHook.StrikeTooEarly.selector || why == IFallpitHook.StrikeTooClose.selector
+                    || why == IFallpitHook.StrikeNotPinned.selector
+                    || why == IFallpitHook.StrikeNoRoom.selector || why == IFallpitHook.StrikeWindow.selector,
+                string.concat("only the strike rules refuse a strike: ", vm.toString(err))
+            );
+        }
+    }
+
     function buy(
         uint256 actorSeed,
         uint256 houseSeed,
@@ -238,18 +270,25 @@ contract SystemHandler is IntegrationFixture {
         if (!_select(h)) return;
         (shares, limitSeed) = _mix(shares, limitSeed);
         address actor = traders[actorSeed % 4];
-        uint256 cap = hook.getConfig(roundId).maxFill;
-        // sometimes the smallest trade there is (one token), sometimes just above the cap
-        shares = limitSeed % 7 == 0 ? bound(shares, 1e18, 1e18 + 1000) : bound(shares, 1e18, cap + cap / 40);
+        {
+            uint256 cap = hook.getConfig(roundId).maxFill;
+            // sometimes the smallest trade there is (one token), sometimes just above the cap
+            shares =
+                limitSeed % 7 == 0 ? bound(shares, 1e18, 1e18 + 1000) : bound(shares, 1e18, cap + cap / 40);
+        }
         uint256 balance = chip.balanceOf(actor);
         if (balance == 0) return;
-        // one commit in eight carries a random (often too low) limit
-        uint256 limit = limitSeed % 8 == 0 ? bound(limitSeed, 1, balance) : balance;
+        uint256 id;
+        RefundReason verdict;
+        {
+            // one commit in eight carries a random (often too low) limit
+            uint256 limit = limitSeed % 8 == 0 ? bound(limitSeed, 1, balance) : balance;
 
-        index = index % _products();
-        (,,,,, RefundReason verdict) = lens.quote(roundId, index, true, shares, prices[h], clock + 2);
-        vm.prank(actor);
-        uint256 id = router.commit{value: FILL_FEE}(roundId, index, true, shares, limit);
+            index = index % _products();
+            (,,,,, verdict) = lens.quote(roundId, index, true, shares, prices[h], clock + 2);
+            vm.prank(actor);
+            id = router.commit{value: FILL_FEE}(roundId, index, true, shares, limit);
+        }
         bool filled = _fillNow(id, h);
         uint256 spent = balance - chip.balanceOf(actor);
         // the lens foresaw the refusals that do not depend on the print (another commit of this second
@@ -289,27 +328,35 @@ contract SystemHandler is IntegrationFixture {
         _tick(h, dt, drift);
         if (!_select(h)) return;
         (shares, limitSeed) = _mix(shares, limitSeed);
-        address actor = traders[actorSeed % 4];
+        _sellHeld(h, traders[actorSeed % 4], index, shares, limitSeed);
+    }
+
+    /// @dev The body of `sell`: `actor` sells some of the first token at or after `index` it holds.
+    function _sellHeld(uint256 h, address actor, uint8 index, uint256 shares, uint256 limitSeed) internal {
         // the first token at or after `index` that the actor holds
-        Ticket[12] memory tokens = ticketsOf(hook, roundId);
         Ticket memory token;
         uint256 held;
-        uint8 n = _products();
-        index = index % n;
-        for (uint8 k; k < n && held == 0; ++k) {
-            index = (index + (k == 0 ? 0 : 1)) % n;
-            token = tokens[index];
-            held = token.balanceOf(actor);
+        {
+            Ticket[15] memory tokens = ticketsOf(hook, roundId);
+            uint8 n = _products();
+            index = index % n;
+            for (uint8 k; k < n && held == 0; ++k) {
+                index = (index + (k == 0 ? 0 : 1)) % n;
+                token = tokens[index];
+                held = token.balanceOf(actor);
+            }
         }
         if (held < 1e18) return; // below the minimum trade: held to settlement
         shares = bound(shares, 1e18, held);
-        uint256 limit = limitSeed % 8 == 0 ? bound(limitSeed, 0, shares) : 0;
         uint256 balance = chip.balanceOf(actor);
-
-        vm.startPrank(actor);
-        token.approve(address(router), shares);
-        uint256 id = router.commit{value: FILL_FEE}(roundId, index, false, shares, limit);
-        vm.stopPrank();
+        uint256 id;
+        {
+            uint256 limit = limitSeed % 8 == 0 ? bound(limitSeed, 0, shares) : 0;
+            vm.startPrank(actor);
+            token.approve(address(router), shares);
+            id = router.commit{value: FILL_FEE}(roundId, index, false, shares, limit);
+            vm.stopPrank();
+        }
         bool filled = _fillNow(id, h);
         uint256 got = chip.balanceOf(actor) - balance;
         if (filled) {
@@ -370,7 +417,7 @@ contract SystemHandler is IntegrationFixture {
         IFallpitHook.RoundState memory st = hook.getState(id);
         if (st.status != IFallpitHook.Status.Final && st.status != IFallpitHook.Status.Void) return;
         address actor = traders[actorSeed % 4];
-        Ticket[12] memory tokens = ticketsOf(hook, id);
+        Ticket[15] memory tokens = ticketsOf(hook, id);
         uint256 n = PitMath.count(hook.getConfig(id).params.menu);
         for (uint256 i; i < n; ++i) {
             uint256 balance = tokens[i].balanceOf(actor);
@@ -465,7 +512,7 @@ contract SystemHandler is IntegrationFixture {
             if (clock < NYTime.closeTs(next) + 5) _warp(NYTime.closeTs(next) + 5);
             for (uint256 h; h < 2; ++h) {
                 _use(tickers[h], address(chip));
-                _recordClose(prices[h], PYTH_SOURCE);
+                _recordClose(prices[h], tickers[h] == KONLY ? KEEPER_SOURCE : PYTH_SOURCE);
             }
             next = _nextTradingDay(next);
         }
@@ -489,8 +536,8 @@ contract SystemHandler is IntegrationFixture {
                 lateVoid = true; // no close today for this ticker: the round is voided after 24 hours
                 continue;
             }
-            // the close: from the keeper set or from Pyth
-            bool keeperClose = (seed >> 8) % 2 == 0;
+            // the close: from the keeper set for KONLY (no Pyth feed), from Pyth for TSLA
+            bool keeperClose = tickers[h] == KONLY;
             _recordClose(prices[h], keeperClose ? KEEPER_SOURCE : PYTH_SOURCE);
             if (!live) continue;
             hook.settleRound(house, day);
@@ -509,15 +556,9 @@ contract SystemHandler is IntegrationFixture {
                     _checkReturn(h, false);
                     continue;
                 }
-                if (mode < 8) {
-                    // a Pyth print for 16:00:00 replaces the keeper's close, at a slightly different price
-                    prices[h] = _grid(prices[h] * (9990 + (seed >> 16) % 21) / 10_000);
-                    _recordClose(prices[h], PYTH_SOURCE);
-                    hook.settleRound(house, day);
-                    ++replacedCloses;
-                } else {
-                    _warp(hook.getState(roundId).settledAt + 900);
-                }
+                // a keeper close finalizes after its challenge window (no Pyth close can replace it: the
+                // ticker has no Pyth feed)
+                _warp(hook.getState(roundId).settledAt + 900);
             }
             _snapshotHouse(h);
             hook.finalizeRound(house, day);
@@ -535,7 +576,7 @@ contract SystemHandler is IntegrationFixture {
                 _checkReturn(h, true);
                 ++voids;
                 // the oracle is back: the missed close goes on the books so the house can roll on
-                _recordClose(prices[h], PYTH_SOURCE);
+                _recordClose(prices[h], tickers[h] == KONLY ? KEEPER_SOURCE : PYTH_SOURCE);
             }
         }
         ++daysRolled;
@@ -571,7 +612,7 @@ contract SystemHandler is IntegrationFixture {
         _before = vault.getHouse(houses[h]);
         _stBefore = hook.getState(roundId);
         _vaultBalanceBefore = chip.balanceOf(address(vault));
-        (, uint256[12] memory premium) = hook.getSupplies(roundId);
+        (, uint256[15] memory premium) = hook.getSupplies(roundId);
         _refundsBefore = 0;
         for (uint256 i; i < MAX_PRODUCTS; ++i) {
             _refundsBefore += premium[i];
@@ -593,10 +634,14 @@ contract SystemHandler is IntegrationFixture {
                 assertEq(owedToTraders, _refundsBefore, "every holder's full cost basis");
             } else {
                 assertLe(owedToTraders, refundable, "never out of the house's capital");
-                assertGe(owedToTraders + MAX_PRODUCTS, refundable, "all of what is above it, up to rounding");
+                assertGe(
+                    owedToTraders + PitMath.count(hook.getConfig(roundId).params.menu),
+                    refundable,
+                    "all of what is above it, up to rounding"
+                );
             }
         } else {
-            (uint256[12] memory supply,) = hook.getSupplies(roundId);
+            (uint256[15] memory supply,) = hook.getSupplies(roundId);
             owedToTraders = PitMath.payoutOf(supply, st.winners);
             assertEq(st.payoutOwed, owedToTraders, "every winning token is owed one chip");
         }
@@ -644,7 +689,7 @@ contract SystemInvariantTest is Test {
         handler.init();
         (chip, hook, router, vault, pm) = handler.system();
 
-        bytes4[] memory selectors = new bytes4[](21);
+        bytes4[] memory selectors = new bytes4[](23);
         for (uint256 i; i < 6; ++i) {
             selectors[i] = SystemHandler.buy.selector;
         }
@@ -661,6 +706,8 @@ contract SystemInvariantTest is Test {
         selectors[18] = SystemHandler.donate.selector;
         selectors[19] = SystemHandler.rollDay.selector;
         selectors[20] = SystemHandler.claimFees.selector;
+        selectors[21] = SystemHandler.strike.selector;
+        selectors[22] = SystemHandler.strike.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         targetContract(address(handler));
     }
@@ -671,13 +718,13 @@ contract SystemInvariantTest is Test {
         for (uint256 r; r < n; ++r) {
             bytes32 id = handler.rounds(r);
             IFallpitHook.RoundState memory st = hook.getState(id);
-            (uint256[12] memory supply, uint256[12] memory premium) = hook.getSupplies(id);
-            Ticket[12] memory tokens = ticketsOf(hook, id);
+            (uint256[15] memory supply, uint256[15] memory premium) = hook.getSupplies(id);
+            Ticket[15] memory tokens = ticketsOf(hook, id);
             uint256 costBasis;
             IFallpitHook.RoundConfig memory c = hook.getConfig(id);
             uint256 menu = c.params.menu;
             uint256 products = PitMath.count(menu);
-            for (uint256 i = products; i < 12; ++i) {
+            for (uint256 i = products; i < 15; ++i) {
                 assertEq(tokens[i].id, 0, "no token above the menu");
                 assertEq(supply[i] + premium[i], 0, "no supply above the menu");
             }
@@ -764,7 +811,7 @@ contract SystemInvariantTest is Test {
         uint256 unclaimed = router.ethOwed(address(handler));
         assertEq(
             address(router).balance,
-            handler.abandonedCount() * 0.0001 ether + unclaimed,
+            handler.abandonedCount() * 0.000025 ether + unclaimed,
             "router ETH is pending fees plus unclaimed fees"
         );
         assertEq(address(hook).balance, 0);
@@ -803,6 +850,7 @@ contract SystemInvariantTest is Test {
         emit log_named_uint("rounds", n);
         emit log_named_uint("of which on a menu other than the default", handler.otherMenus());
         emit log_named_uint("buys refused for a product cap", handler.capRefusals());
+        emit log_named_uint("live strikes opened", handler.strikes());
         emit log_named_uint("commits made in the after-hours", handler.tradesByWindow(0));
         emit log_named_uint("commits made in the pre-market", handler.tradesByWindow(1));
         emit log_named_uint("commits made in the regular session", handler.tradesByWindow(2));
@@ -811,7 +859,6 @@ contract SystemInvariantTest is Test {
         emit log_named_uint("refunds", handler.refunds());
         emit log_named_uint("LP moves", handler.lpMoves());
         emit log_named_uint("keeper closes", handler.keeperCloses());
-        emit log_named_uint("closes replaced by Pyth", handler.replacedCloses());
         emit log_named_uint("voids", handler.voids());
         emit log_named_uint("disputes", handler.disputes());
         emit log_named_uint("house winning rounds", handler.houseWins());

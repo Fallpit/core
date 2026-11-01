@@ -5,7 +5,6 @@ import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 
 import {HookFixture} from "./HookFixture.sol";
 import {Ticket, ticketsOf, ticketOf} from "../Ticket.sol";
-import {LadderMath} from "../../src/LadderMath.sol";
 import {FallpitLens} from "../../src/hook/FallpitLens.sol";
 import {IFallpitHook, RefundReason} from "../../src/interfaces/IFallpitHook.sol";
 import {IFallpitRouter} from "../../src/interfaces/IFallpitRouter.sol";
@@ -13,6 +12,7 @@ import {IPitBook} from "../../src/hook/IPitBook.sol";
 import {PitMath} from "../../src/hook/PitMath.sol";
 import {NYTime} from "../../src/lib/NYTime.sol";
 import {Menus} from "../Menus.sol";
+import {ILadderMath} from "../../src/interfaces/ILadderMath.sol";
 
 /// @notice The menu of a round: how it is encoded and bounded, that the owner's menu waits 24 hours and is
 ///         frozen in a round, what tokens it deploys, and rounds on menus other than the default (with
@@ -152,7 +152,7 @@ contract FallpitMenuTest is HookFixture {
         uint256 menu = PitMath.pack(lo, hi);
         assertTrue(PitMath.validMenu(menu));
         assertEq(PitMath.count(menu), n);
-        uint256[12] memory supply;
+        uint256[15] memory supply;
         for (uint256 i; i < n; ++i) {
             (uint8 a, uint8 b) = PitMath.run(menu, i);
             assertEq(a, lo[i]);
@@ -185,7 +185,7 @@ contract FallpitMenuTest is HookFixture {
     /// @dev The token and the lens compute a product's price range with `PitMath.edge`; the hook settles
     ///      on the engine's `bandOf`. The two must use the same edges, to the wei.
     function testFuzz_menu_edgesAreTheEngines(uint256 sigma, uint8 m) public {
-        LadderMath real = new LadderMath();
+        ILadderMath real = ILadderMath(deployCode("LadderMath.sol:LadderMath"));
         sigma = bound(sigma, 0.005e18, 0.15e18);
         m = uint8(bound(m, 0, 38));
         assertEq(PitMath.edge(sigma, m), real.edge(sigma, m));
@@ -235,7 +235,7 @@ contract FallpitMenuTest is HookFixture {
         assertEq(c.params.menu, Menus.sixFloorsAndPair());
         assertEq(c.params.floorCapBps, 500);
         assertEq(c.params.minPriceWad, 0.05e18);
-        Ticket[12] memory tokens = ticketsOf(hook, roundId);
+        Ticket[15] memory tokens = ticketsOf(hook, roundId);
         for (uint256 i; i < 12; ++i) {
             assertEq(tokens[i].id != 0, i < 8, "eight products, eight tickets");
         }
@@ -262,7 +262,7 @@ contract FallpitMenuTest is HookFixture {
         _open();
         // a ticket has no name of its own: the lens tells the run and its prices; the id is the round id
         // and the index
-        Ticket[12] memory t = ticketsOf(hook, roundId);
+        Ticket[15] memory t = ticketsOf(hook, roundId);
         uint256 menu = hook.getConfig(roundId).params.menu;
         for (uint256 i; i < 8; ++i) {
             (uint8 lo, uint8 hi) = PitMath.run(menu, i);
@@ -383,20 +383,25 @@ contract FallpitMenuTest is HookFixture {
         assertEq(uint8(rejection), uint8(RefundReason.None));
         assertLt(pBefore, 0.02e18, "the engine asks less than the minimum");
         uint256 minimum = shares * 2 / 100;
-        uint256 vegaFee = shares / 10 * math.VEGA() / 1e18;
-        assertEq(fee, minimum * 2 / 100 + vegaFee, "the fee is taken on the minimum price");
+        assertEq(
+            fee, minimum * 2 / 100 + shares / 10 * math.VEGA() / 1e18, "the fee is taken on the minimum price"
+        );
         assertEq(quoted, minimum + fee);
         uint256 heldBefore = _state().held;
         uint256 cost = _buy(alice, F0, shares, S0 * 103 / 100);
         assertEq(cost, quoted);
         assertEq(_state().held - heldBefore, cost, "all of it is in the round");
-        (, uint256[12] memory premium) = hook.getSupplies(roundId);
-        assertEq(premium[F0], cost, "and in the token's cost basis");
+        {
+            (, uint256[15] memory premium) = hook.getSupplies(roundId);
+            assertEq(premium[F0], cost, "and in the token's cost basis");
+        }
 
         // a sell is paid the engine's price, not the minimum
-        (uint256 net,,,,,) = lens.quote(roundId, F0, false, shares, S0 * 103 / 100, clock + 2);
-        assertLt(net, minimum / 2);
-        assertEq(_sell(alice, F0, shares, S0 * 103 / 100), net);
+        {
+            (uint256 net,,,,,) = lens.quote(roundId, F0, false, shares, S0 * 103 / 100, clock + 2);
+            assertLt(net, minimum / 2);
+            assertEq(_sell(alice, F0, shares, S0 * 103 / 100), net);
+        }
 
         // a product priced above the minimum is not touched by it
         (uint256 chips, uint256 pairFee, uint256 pairPrice,,,) =
@@ -441,7 +446,7 @@ contract FallpitMenuTest is HookFixture {
         }
         _assertSupplies();
         _assertHookSolvent(address(chip));
-        (uint256[12] memory supply,) = hook.getSupplies(roundId);
+        (uint256[15] memory supply,) = hook.getSupplies(roundId);
         IFallpitHook.RoundState memory open = _state();
         (uint256 worst, uint256 covered) = lens.solvency(roundId);
         assertLe(worst, covered);
@@ -551,8 +556,8 @@ contract FallpitMenuTest is HookFixture {
         assertEq(m.floor, floor);
 
         assertEq(m.products.length, 10);
-        Ticket[12] memory tokens = ticketsOf(hook, roundId);
-        (uint256[12] memory supply, uint256[12] memory premium) = hook.getSupplies(roundId);
+        Ticket[15] memory tokens = ticketsOf(hook, roundId);
+        (uint256[15] memory supply, uint256[15] memory premium) = hook.getSupplies(roundId);
         uint256 floorsSum;
         for (uint256 i; i < 10; ++i) {
             FallpitLens.Product memory q = m.products[i];

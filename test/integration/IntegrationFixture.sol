@@ -7,7 +7,6 @@ import {PoolManager} from "v4-core/PoolManager.sol";
 import {CustomRevert} from "v4-core/libraries/CustomRevert.sol";
 
 import {FallpitDeployer} from "../../script/FallpitDeployer.sol";
-import {LadderMath} from "../../src/LadderMath.sol";
 import {PitOracle} from "../../src/PitOracle.sol";
 import {ChipGuard} from "../../src/ChipGuard.sol";
 import {PitVault} from "../../src/PitVault.sol";
@@ -30,6 +29,7 @@ import {OracleTestBase} from "../oracle/OracleTestBase.sol";
 import {MockPyth} from "../oracle/mocks/MockPyth.sol";
 import {MockChip, MockFeeChip} from "../hook/mocks/MockChips.sol";
 import {StandardMenu} from "../Menus.sol";
+import {ILadderMath} from "../../src/interfaces/ILadderMath.sol";
 
 /// @notice The whole system with nothing mocked but the outside world: the real LadderMath, PitOracle,
 ///         ChipGuard, PitVault, PitBook, FallpitRouter, FallpitHook (created through the CREATE2 factory),
@@ -60,12 +60,12 @@ abstract contract IntegrationFixture is OracleTestBase, FallpitDeployer, Standar
     uint256 internal constant SEED_VAR = 0.0004e18; // sigma = 2%
     uint256 internal constant HOUSE_CAPITAL = 1_000_000e18;
     /// @dev The book's default fill fee: what every commit carries unless a test sets other parameters.
-    uint256 internal constant FILL_FEE = 0.0001 ether;
+    uint256 internal constant FILL_FEE = 0.000025 ether;
     /// @dev Pyth prices here have 5 decimals: one unit is 1e13 wei of WAD.
     uint256 internal constant PRICE_GRID = 1e13;
 
     PoolManager internal pm;
-    LadderMath internal math;
+    ILadderMath internal math;
     PitOracle internal oracle;
     ChipGuard internal guard;
     PitVault internal vault;
@@ -160,10 +160,11 @@ abstract contract IntegrationFixture is OracleTestBase, FallpitDeployer, Standar
         book.setDefaultParams(p);
         vm.stopPrank();
 
-        // Monday's closes: NVDA from the keeper set, TSLA from Pyth
+        // Monday's closes, from Pyth (a ticker with a Pyth feed closes on Pyth only)
         uint64 close0 = NYTime.closeTs(day0);
         _warp(close0 + 60);
-        book.recordClose(NVDA, day0, _keeperPrint(NVDA, S0, close0));
+        _keeperPrint(NVDA, S0, close0); // the mirror feed's round at the close, for later keeper prints
+        book.recordClose(NVDA, day0, _pythPrint(NVDA, S0, close0));
         book.recordClose(TSLA, day0, _pythPrint(TSLA, TSLA_S0, close0));
 
         // the default round: NVDA in the plain chip, one LP
@@ -171,6 +172,30 @@ abstract contract IntegrationFixture is OracleTestBase, FallpitDeployer, Standar
         roundChip = address(chip);
         house = _createHouse(NVDA, address(chip));
         _lpDeposit(lp, house, HOUSE_CAPITAL);
+    }
+
+    /// @notice A stock with no Pyth feed: its closes come from the keeper set (the only ticker kind with a
+    ///         keeper close, a challenge window and disputes).
+    bytes32 internal constant KONLY = bytes32("KONLY");
+
+    /// @dev Moves the suite's default round to KONLY in the plain chip, one LP, with its Monday close from
+    ///      the keeper set. Call right after setUp.
+    function _useKeeperClosedTicker() internal {
+        vm.startPrank(owner);
+        _addTicker(KONLY, bytes32(0), IPitBook.FillSource.KeeperOnly);
+        vm.stopPrank();
+        book.recordClose(KONLY, day0, _keeperPrint(KONLY, S0, NYTime.closeTs(day0)));
+        // the LP moves its capital from the idle NVDA house, so no chip is minted for the move
+        uint256 shares = vault.balanceOf(lp, uint256(house));
+        vm.prank(lp);
+        uint256 assets = vault.requestWithdraw(house, shares);
+        require(assets == HOUSE_CAPITAL, "the NVDA house is idle");
+        ticker = KONLY;
+        house = _createHouse(KONLY, address(chip));
+        vm.startPrank(lp);
+        chip.approve(address(vault), assets);
+        vault.deposit(house, assets);
+        vm.stopPrank();
     }
 
     /// @dev Creates a house by the lister's owner route (no anchor check, no seed).
@@ -469,8 +494,8 @@ abstract contract IntegrationFixture is OracleTestBase, FallpitDeployer, Standar
     }
 
     function _assertSupplies() internal view {
-        (uint256[12] memory supply,) = hook.getSupplies(roundId);
-        Ticket[12] memory tokens = ticketsOf(hook, roundId);
+        (uint256[15] memory supply,) = hook.getSupplies(roundId);
+        Ticket[15] memory tokens = ticketsOf(hook, roundId);
         uint256 n = PitMath.count(hook.getConfig(roundId).params.menu);
         for (uint256 i; i < MAX_PRODUCTS; ++i) {
             if (i < n) {

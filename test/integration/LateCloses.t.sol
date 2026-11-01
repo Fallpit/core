@@ -51,6 +51,7 @@ contract LateClosesTest is IntegrationFixture {
 
     /// @dev The owner's gap-fill after the void point is late too: the 24 hour void still works.
     function test_missedClose_ownerGapFillAfterTheVoidPoint_doesNotStopTheVoid() public {
+        _useKeeperClosedTicker();
         _open();
         _fund(alice, STAKE);
         _buy(alice, LOWER, 1_000e18, S0);
@@ -110,6 +111,7 @@ contract LateClosesTest is IntegrationFixture {
     ///      stop at once, but the round's close still verifies, even when it is recorded hours later, and
     ///      the round settles on it. Only closes a day later are refused.
     function test_oracleOwner_switchOffAfterTheRoundOpened_doesNotStopItsClose() public {
+        _useKeeperClosedTicker();
         _open();
         _fund(alice, STAKE);
         _buy(alice, HIGHER, 1_000e18, S0);
@@ -158,7 +160,9 @@ contract LateClosesTest is IntegrationFixture {
         assertEq(oracle.config(amd).pythFeedId, bytes32(0), "not in force yet");
         (PitOracle.TickerConfig memory p, uint64 from) = oracle.pendingConfig(amd);
         assertEq(p.pythFeedId, NVDA_ID);
-        assertEq(from, clock + 24 hours);
+        // the delay, then the next hours with no close to record (04:00 to 15:30 New York)
+        assertEq(from, oracle.clearOfCloses(clock + 24 hours));
+        assertGe(from, clock + 24 hours);
     }
 
     // ----------------------------------------------------------------------- forwarder addresses

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Test vectors for LadderMath and Gaussian (Python 3.9, numpy only, no scipy, no mpmath).
 
 Run from anywhere:  python3 contracts/test/vectors/gen_vectors.py

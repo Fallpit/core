@@ -22,7 +22,7 @@ function balanceOf(Ticket memory t, address owner) view returns (uint256) {
 /// @dev Every ticket of the id there is: the round's outstanding supply of the product.
 function totalSupply(Ticket memory t) view returns (uint256) {
     (bytes32 roundId, uint8 index) = t.hook.tokenRef(t.id);
-    (uint256[12] memory supply,) = t.hook.getSupplies(roundId);
+    (uint256[15] memory supply,) = t.hook.getSupplies(roundId);
     return supply[index];
 }
 
@@ -71,10 +71,10 @@ function isZero(Ticket memory t) pure returns (bool) {
 }
 
 /// @dev The tickets of a round, index = product; id zero above the menu (and for an unknown round).
-function ticketsOf(FallpitHook hook, bytes32 roundId) view returns (Ticket[12] memory out) {
+function ticketsOf(FallpitHook hook, bytes32 roundId) view returns (Ticket[15] memory out) {
     uint256 n = PitMath.count(hook.getConfig(roundId).params.menu);
     if (hook.getState(roundId).status == IFallpitHook.Status.None) n = 0;
-    for (uint256 i; i < 12; ++i) {
+    for (uint256 i; i < PitMath.MAX_PRODUCTS; ++i) {
         out[i] = Ticket(hook, i < n ? hook.tokenId(roundId, uint8(i)) : 0);
     }
 }

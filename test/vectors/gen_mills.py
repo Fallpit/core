@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """The Mills ratio table of src/lib/Gaussian.sol (its normal CDF), and its check in exact integer arithmetic.
 
 Run:  python3 contracts/test/vectors/gen_mills.py contracts/test/vectors/gaussian.json > mills_body.txt

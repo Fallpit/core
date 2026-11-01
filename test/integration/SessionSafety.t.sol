@@ -313,7 +313,10 @@ contract SessionSafetyTest is IntegrationFixture {
         assertEq(router.sessionOf(sam, sessionKey).expiry, 0, "revoked");
         router.cancelWithSig(sam, 6, sessionKey, _sig(sessionPk, router.cancelDigest(sam, 6)));
 
-        // the same key granted again: the cancelled orders stay dead
+        // the same key granted again (after a nonce bump; the revoke holds at the old nonce): the
+        // cancelled orders stay dead
+        vm.prank(sam);
+        router.bumpSessionNonce();
         _grantSam(1e30 - 1, 0, 3);
         _relayReverts(o, abi.encodeWithSelector(IFallpitRouter.OrderUsed.selector));
         _relayReverts(

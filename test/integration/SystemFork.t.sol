@@ -43,7 +43,7 @@ contract SystemForkTest is OracleTestBase, StandardMenu {
     IPyth internal constant PYTH = IPyth(0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a);
     bytes32 internal constant NVDA = bytes32("NVDA");
     /// @dev The book's default fill fee: what every commit carries.
-    uint256 internal constant FILL_FEE = 0.0001 ether;
+    uint256 internal constant FILL_FEE = 0.000025 ether;
     // Robinhood Chain mainnet (4663): the NVDA push feed and stock token
     address internal constant NVDA_FEED = 0x379EC4f7C378F34a1B47E4F3cbeBCbAC3E8E9F15;
     address internal constant NVDA_TOKEN = 0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC;
@@ -222,10 +222,12 @@ contract SystemForkTest is OracleTestBase, StandardMenu {
         uint256 fee = _pythFee(TslaDay20261002.THU_CLOSE_BLOB);
         emit log_named_uint("Pyth update fee (wei)", fee);
         book.recordClose{value: fee}(TSLA, thursday, _pyth(TslaDay20261002.THU_CLOSE_BLOB));
-        (uint256 s0, bool trustless) = book.closeOf(TSLA, thursday);
-        assertEq(s0, TslaDay20261002.THU_CLOSE_PRICE_WAD);
-        assertEq(s0, 354.15698e18);
-        assertTrue(trustless);
+        {
+            (uint256 s0, bool trustless) = book.closeOf(TSLA, thursday);
+            assertEq(s0, TslaDay20261002.THU_CLOSE_PRICE_WAD);
+            assertEq(s0, 354.15698e18);
+            assertTrue(trustless);
+        }
         book.recordClose(NVDA, thursday, _keeperPrint(185e18, TslaDay20261002.THU_CLOSE_T));
 
         // ---- Friday's rounds open (the capital sits in the hook, not in the live PoolManager)
@@ -239,8 +241,8 @@ contract SystemForkTest is OracleTestBase, StandardMenu {
             assertEq(hook.getConfig(nvdaRound).s0, 185e18);
         }
         assertEq(chip.balanceOf(address(hook)), 201_000e18, "both houses' capital sits in the hook");
-        Ticket[12] memory tsla = ticketsOf(hook, tslaRound);
-        Ticket[12] memory nvda = ticketsOf(hook, nvdaRound);
+        Ticket[15] memory tsla = ticketsOf(hook, tslaRound);
+        Ticket[15] memory nvda = ticketsOf(hook, nvdaRound);
         emit log_named_uint("the pair, from", tsla[HIGHER].low());
         emit log_named_uint("a floor, from", tsla[F6].low());
         emit log_named_uint("the far floor, from", tsla[F7].low());
@@ -254,24 +256,28 @@ contract SystemForkTest is OracleTestBase, StandardMenu {
         _wrongPrintsDoNotFill(a);
         _fillPyth(a, TslaDay20261002.FRI_1100_BLOB);
         _fillKeeper(b, 186.2e18);
-        uint256 alicePaid = 1_000e18 - chip.balanceOf(alice);
-        emit log_named_decimal_uint("alice paid for 300 TSLA HIGHER at the previous close", alicePaid, 18);
-        emit log_named_decimal_uint(
-            "bob paid for 300 NVDA HIGHER at the previous close", 1_000e18 - chip.balanceOf(bob), 18
-        );
-        assertGt(alicePaid, 270e18);
-        assertLt(alicePaid, 320e18);
+        {
+            uint256 alicePaid = 1_000e18 - chip.balanceOf(alice);
+            emit log_named_decimal_uint("alice paid for 300 TSLA HIGHER at the previous close", alicePaid, 18);
+            emit log_named_decimal_uint(
+                "bob paid for 300 NVDA HIGHER at the previous close", 1_000e18 - chip.balanceOf(bob), 18
+            );
+            assertGt(alicePaid, 270e18);
+            assertLt(alicePaid, 320e18);
+        }
         assertEq(tsla[HIGHER].balanceOf(alice), 300e18);
 
         // ---- 14:30:02. bob buys two TSLA floors, the one above +2 sigma and the one from +1 to +2
         //      sigma; alice buys NVDA LOWER.
         vm.warp(TslaDay20261002.FRI_1430_T - 2);
         a = _commit(bob, tslaRound, F7, true, 400e18, 400e18);
-        uint256 a2 = _commit(bob, tslaRound, F6, true, 100e18, 300e18);
-        b = _commit(alice, nvdaRound, LOWER, true, 200e18, 300e18);
-        vm.warp(TslaDay20261002.FRI_1430_T);
-        _fillPyth(a, TslaDay20261002.FRI_1430_BLOB);
-        _fillPyth(a2, TslaDay20261002.FRI_1430_BLOB);
+        {
+            uint256 a2 = _commit(bob, tslaRound, F6, true, 100e18, 300e18);
+            b = _commit(alice, nvdaRound, LOWER, true, 200e18, 300e18);
+            vm.warp(TslaDay20261002.FRI_1430_T);
+            _fillPyth(a, TslaDay20261002.FRI_1430_BLOB);
+            _fillPyth(a2, TslaDay20261002.FRI_1430_BLOB);
+        }
         _fillKeeper(b, 185.9e18);
         assertEq(tsla[F7].balanceOf(bob), 400e18);
         assertEq(tsla[F6].balanceOf(bob), 100e18);
@@ -281,10 +287,14 @@ contract SystemForkTest is OracleTestBase, StandardMenu {
         a = _commit(alice, tslaRound, HIGHER, false, 100e18, 0);
         b = _commit(bob, nvdaRound, HIGHER, false, 150e18, 0);
         vm.warp(TslaDay20261002.FRI_1520_T);
-        uint256 before = chip.balanceOf(alice);
-        _fillPyth(a, TslaDay20261002.FRI_1520_BLOB);
-        _fillKeeper(b, 186.6e18);
-        emit log_named_decimal_uint("alice received for 100 TSLA HIGHER", chip.balanceOf(alice) - before, 18);
+        {
+            uint256 before = chip.balanceOf(alice);
+            _fillPyth(a, TslaDay20261002.FRI_1520_BLOB);
+            _fillKeeper(b, 186.6e18);
+            emit log_named_decimal_uint(
+                "alice received for 100 TSLA HIGHER", chip.balanceOf(alice) - before, 18
+            );
+        }
         IFallpitHook.RoundState memory tslaOpen = hook.getState(tslaRound);
         IFallpitHook.RoundState memory nvdaOpen = hook.getState(nvdaRound);
         assertLt(tslaOpen.g, 1e18, "depth has decayed by the afternoon");
@@ -296,21 +306,25 @@ contract SystemForkTest is OracleTestBase, StandardMenu {
         vm.deal(bob, 1 ether);
         vm.prank(bob);
         book.recordClose{value: fee}(TSLA, friday, _pyth(TslaClose20261002.BLOB));
-        (uint256 close, bool closeTrustless) = book.closeOf(TSLA, friday);
-        assertEq(close, TslaClose20261002.PRICE_WAD);
-        assertEq(close, 370.65425e18);
-        assertTrue(closeTrustless);
+        {
+            (uint256 close, bool closeTrustless) = book.closeOf(TSLA, friday);
+            assertEq(close, TslaClose20261002.PRICE_WAD);
+            assertEq(close, 370.65425e18);
+            assertTrue(closeTrustless);
+        }
         book.recordClose(NVDA, friday, _keeperPrint(186.5e18, TslaClose20261002.T));
 
         hook.settleRound(tslaHouse, friday);
         hook.settleRound(nvdaHouse, friday);
-        IFallpitHook.RoundState memory settled = hook.getState(tslaRound);
-        assertTrue(settled.settledTrustless);
-        // +4.55% on a 3.5% sigma: band 25, so the floor from +1 to +2 sigma wins, and HIGHER. alice's 200
-        // HIGHER and bob's 100 of the floor.
-        assertEq(settled.closeBand, 25);
-        assertEq(settled.winners, uint16(1 << F6 | 1 << HIGHER));
-        assertEq(settled.payoutOwed, 300e18);
+        {
+            IFallpitHook.RoundState memory settled = hook.getState(tslaRound);
+            assertTrue(settled.settledTrustless);
+            // +4.55% on a 3.5% sigma: band 25, so the floor from +1 to +2 sigma wins, and HIGHER. alice's 200
+            // HIGHER and bob's 100 of the floor.
+            assertEq(settled.closeBand, 25);
+            assertEq(settled.winners, uint16(1 << F6 | 1 << HIGHER));
+            assertEq(settled.payoutOwed, 300e18);
+        }
         hook.finalizeRound(tslaHouse, friday);
         vm.expectRevert(IFallpitHook.ChallengeWindowOpen.selector);
         hook.finalizeRound(nvdaHouse, friday);
@@ -331,29 +345,17 @@ contract SystemForkTest is OracleTestBase, StandardMenu {
         router.redeem(tsla[F7].id, 400e18);
         assertEq(hook.collectProtocolFees(address(chip)), tslaOpen.protocolFees + nvdaOpen.protocolFees);
 
-        PitVault.House memory h = vault.getHouse(tslaHouse);
-        assertFalse(h.locked);
-        assertEq(h.lpAssets + h.endowment, tslaOpen.held - 300e18 - tslaOpen.protocolFees);
-        emit log_named_decimal_int(
-            "TSLA house result on 101,000 (chips)", int256(h.lpAssets + h.endowment) - 101_000e18, 18
-        );
-        PitVault.House memory n = vault.getHouse(nvdaHouse);
-        assertEq(n.lpAssets, nvdaOpen.held - 150e18 - nvdaOpen.protocolFees);
-        emit log_named_decimal_int(
-            "NVDA house result on 100,000 (chips)", int256(n.lpAssets) - 100_000e18, 18
-        );
-        uint256 carolShares = vault.balanceOf(carol, uint256(tslaHouse));
-        vm.prank(carol);
-        uint256 out = vault.requestWithdraw(tslaHouse, carolShares);
-        assertApproxEqAbs(out, h.lpAssets * 1_000 / 101_000, 2, "carol's 1,000 of 101,000");
+        _checkHouses(tslaHouse, nvdaHouse, tslaOpen, nvdaOpen);
         // Friday's real return stepped TSLA's variance
         assertEq(book.getTicker(TSLA).lastCloseDay, friday);
         assertTrue(book.getTicker(TSLA).lastCloseStepped);
 
         // ---- every coin is accounted for: nothing was created, nothing is stranded
-        (uint256 claims, uint256 owed) = Accounting.read(address(hook), address(chip));
-        assertEq(claims, owed);
-        assertEq(owed, 0, "only losing tokens are left outstanding");
+        {
+            (uint256 claims, uint256 owed) = Accounting.read(address(hook), address(chip));
+            assertEq(claims, owed);
+            assertEq(owed, 0, "only losing tokens are left outstanding");
+        }
         assertEq(chip.balanceOf(POOL_MANAGER), 0, "nothing ever went to the PoolManager");
         assertEq(chip.balanceOf(address(router)), 0);
         assertEq(chip.totalSupply(), supplyAtStart, "the day minted and burned nothing");
@@ -364,6 +366,34 @@ contract SystemForkTest is OracleTestBase, StandardMenu {
             "cash conservation"
         );
         assertEq(vault.accounted(address(chip)), chip.balanceOf(address(vault)));
+    }
+
+    /// @dev Friday's result in both houses, and carol's withdrawal from the TSLA house.
+    function _checkHouses(
+        bytes32 tslaHouse,
+        bytes32 nvdaHouse,
+        IFallpitHook.RoundState memory tslaOpen,
+        IFallpitHook.RoundState memory nvdaOpen
+    ) internal {
+        PitVault.House memory h = vault.getHouse(tslaHouse);
+        assertFalse(h.locked);
+        assertEq(h.lpAssets + h.endowment, tslaOpen.held - 300e18 - tslaOpen.protocolFees);
+        emit log_named_decimal_int(
+            "TSLA house result on 101,000 (chips)", int256(h.lpAssets + h.endowment) - 101_000e18, 18
+        );
+        {
+            PitVault.House memory n = vault.getHouse(nvdaHouse);
+            assertEq(n.lpAssets, nvdaOpen.held - 150e18 - nvdaOpen.protocolFees);
+            emit log_named_decimal_int(
+                "NVDA house result on 100,000 (chips)", int256(n.lpAssets) - 100_000e18, 18
+            );
+        }
+        {
+            uint256 carolShares = vault.balanceOf(carol, uint256(tslaHouse));
+            vm.prank(carol);
+            uint256 out = vault.requestWithdraw(tslaHouse, carolShares);
+            assertApproxEqAbs(out, h.lpAssets * 1_000 / 101_000, 2, "carol's 1,000 of 101,000");
+        }
     }
 
     /// @dev The TSLA commit priced at 11:00:07 does not fill with another instant's update, nor with a

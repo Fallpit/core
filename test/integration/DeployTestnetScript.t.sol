@@ -114,7 +114,7 @@ contract DeployTestnetScriptTest is Test {
         // the parameters a round opened on this deployment gets: nothing is passed to the script, they
         // are the book's own defaults
         IPitBook.Params memory params = s.core.book.defaultParams();
-        assertEq(params.fillFee, 0.0001 ether, "the trader-paid fill fee");
+        assertEq(params.fillFee, 0.000025 ether, "the trader-paid fill fee");
         // the book's defaults
         assertEq(params.lossLimitBps, 3000, "the per-round loss limit: 30% of the capital");
         assertEq(params.floorCapBps, 10_000, "no product cap on a floor");
@@ -143,35 +143,40 @@ contract DeployTestnetScriptTest is Test {
         // the stocks on the New York weekday clock, ETH and BTC on the every-day clock
         for (uint256 i; i < 8; ++i) {
             bytes32 ticker = cfg.tickers[i].ticker;
-            PitOracle.TickerConfig memory oc = s.core.oracle.config(ticker);
-            assertEq(oc.pythFeedId, cfg.tickers[i].pythFeedId);
-            assertTrue(oc.pythFeedId != bytes32(0));
-            assertEq(oc.aggregator, address(s.feeds[i]));
-            assertEq(oc.stockToken, address(s.stockTokens[i]));
-            assertEq(oc.boundBps, 60, "the keeper band: the oracle's default");
+            {
+                PitOracle.TickerConfig memory oc = s.core.oracle.config(ticker);
+                assertEq(oc.pythFeedId, cfg.tickers[i].pythFeedId);
+                assertTrue(oc.pythFeedId != bytes32(0));
+                assertEq(oc.aggregator, address(s.feeds[i]));
+                assertEq(oc.stockToken, address(s.stockTokens[i]));
+                assertEq(oc.boundBps, 60, "the keeper band: the oracle's default");
+            }
             assertEq(s.feeds[i].decimals(), 8);
             assertEq(s.feeds[i].pusher(), pusher);
             assertEq(s.feeds[i].owner(), owner);
             assertEq(s.stockTokens[i].uiMultiplier(), 1e18);
             assertTrue(s.core.oracle.supported(ticker));
-            IPitBook.Ticker memory tk = s.core.book.getTicker(ticker);
-            assertEq(tk.varWad, cfg.tickers[i].seedVar);
-            bool crypto = ticker == bytes32("ETH") || ticker == bytes32("BTC");
-            // ETH is keeper-priced: the deployer's Pyth key cannot read the crypto feeds either (Hermes 403)
-            bool pythFill = ticker == bytes32("TSLA") || ticker == bytes32("QQQ") || ticker == bytes32("BTC");
-            assertEq(
-                uint8(tk.fillSource),
-                uint8(pythFill ? IPitBook.FillSource.TrustlessOnly : IPitBook.FillSource.KeeperOnly)
-            );
-            assertEq(uint8(tk.clock), uint8(crypto ? IPitBook.Clock.EveryDay : IPitBook.Clock.NYWeekdays));
-            assertEq(tk.windows, crypto ? 15 : 13, "stocks: no trading from 20:00 to 04:00 by default");
-            if (crypto) {
-                assertEq(tk.weights.regular, 10_000, "one segment from close to close");
-            } else {
-                assertEq(tk.weights.afterHours, 600);
-                assertEq(tk.weights.gap, 1400);
-                assertEq(tk.weights.preMarket, 1000);
-                assertEq(tk.weights.regular, 7000);
+            {
+                IPitBook.Ticker memory tk = s.core.book.getTicker(ticker);
+                assertEq(tk.varWad, cfg.tickers[i].seedVar);
+                bool crypto = ticker == bytes32("ETH") || ticker == bytes32("BTC");
+                // ETH is keeper-priced: the deployer's Pyth key cannot read the crypto feeds either (Hermes 403)
+                bool pythFill =
+                    ticker == bytes32("TSLA") || ticker == bytes32("QQQ") || ticker == bytes32("BTC");
+                assertEq(
+                    uint8(tk.fillSource),
+                    uint8(pythFill ? IPitBook.FillSource.TrustlessOnly : IPitBook.FillSource.KeeperOnly)
+                );
+                assertEq(uint8(tk.clock), uint8(crypto ? IPitBook.Clock.EveryDay : IPitBook.Clock.NYWeekdays));
+                assertEq(tk.windows, crypto ? 15 : 13, "stocks: no trading from 20:00 to 04:00 by default");
+                if (crypto) {
+                    assertEq(tk.weights.regular, 10_000, "one segment from close to close");
+                } else {
+                    assertEq(tk.weights.afterHours, 600);
+                    assertEq(tk.weights.gap, 1400);
+                    assertEq(tk.weights.preMarket, 1000);
+                    assertEq(tk.weights.regular, 7000);
+                }
             }
             // houses: one per (ticker, chip), seeded
             for (uint256 k; k < 2; ++k) {

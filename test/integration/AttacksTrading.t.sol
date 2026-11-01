@@ -442,10 +442,12 @@ contract AttacksTradingTest is AttackBase {
     ///      and the house ends the day with at least 70% of what it brought: the gang trades one token
     ///      only, and a sell of it can never take the cushion under the floor (SPEC 7.5): the whipsaw gang takes exactly the limit.
     function test_attack_whipsaw_lossLimitStopsTheBuying_houseKeepsSeventyPercent() public {
-        IPitBook.Params memory p = book.defaultParams();
-        assertEq(p.lossLimitBps, 3000);
-        p.maxFillBps = 1000;
-        _setParams(p);
+        {
+            IPitBook.Params memory p = book.defaultParams();
+            assertEq(p.lossLimitBps, 3000);
+            p.maxFillBps = 1000;
+            _setParams(p);
+        }
         _open();
         uint256 cap = hook.getConfig(roundId).maxFill;
         PitAttacker gang = _attacker(address(chip), 3_000_000e18);
@@ -460,28 +462,10 @@ contract AttacksTradingTest is AttackBase {
         for (uint256 cycles; cycles < 8; ++cycles) {
             // at the low: buy while a capped fill still costs under half a chip per token
             bool blocked;
-            for (uint256 k; k < 6; ++k) {
-                (uint256 quoted,,,,, RefundReason rejection) =
-                    lens.quote(roundId, HIGHER, true, cap, low, clock + 2);
-                if (quoted > cap / 2) break;
-                bool filled = _tryTrade(gang, HIGHER, true, cap, low);
-                assertEq(filled, rejection == RefundReason.None, "the lens foresaw it");
-                if (!filled) {
-                    assertEq(uint8(rejection), uint8(RefundReason.LossLimit));
-                    ++refusedBuys;
-                    blocked = true;
-                    // a smaller lot may still fit under the limit (at 30% the first lot of a cycle is
-                    // what gets refused once the swings have taken the house near the floor); the
-                    // gang takes it, so that it holds something to sell while buys are blocked
-                    for (uint256 small = cap / 5; small >= cap / 500; small /= 10) {
-                        if (_tryTrade(gang, HIGHER, true, small, low)) break;
-                    }
-                    break;
-                }
-                (uint256 afterBuy, uint256 limitFloor) = lens.lossLimit(roundId);
-                assertEq(limitFloor, floor);
-                assertGe(afterBuy, floor, "every buy that fills leaves the house 70% of its capital");
-                if (afterBuy < lowestCushion) lowestCushion = afterBuy;
+            {
+                uint256 refused;
+                (refused, blocked, lowestCushion) = _whipBuys(gang, cap, low, floor, lowestCushion);
+                refusedBuys += refused;
             }
             // at the high: sell everything back. A sell is never refused for the loss limit.
             uint256 balance = _token(HIGHER).balanceOf(address(gang));
@@ -519,6 +503,37 @@ contract AttacksTradingTest is AttackBase {
         );
         assertGe(back, floor, "the house keeps at least 70% of what it brought");
         assertLt(back, HOUSE_CAPITAL * 4 / 5, "scenario: the limit was what stopped the loss");
+    }
+
+    /// @dev The buys at the low of one whipsaw cycle (`test_attack_whipsaw_lossLimitStopsTheBuying_...`).
+    function _whipBuys(PitAttacker gang, uint256 cap, uint256 low, uint256 floor, uint256 lowestIn)
+        internal
+        returns (uint256 refused, bool blocked, uint256 lowest)
+    {
+        lowest = lowestIn;
+        for (uint256 k; k < 6; ++k) {
+            (uint256 quoted,,,,, RefundReason rejection) =
+                lens.quote(roundId, HIGHER, true, cap, low, clock + 2);
+            if (quoted > cap / 2) break;
+            bool filled = _tryTrade(gang, HIGHER, true, cap, low);
+            assertEq(filled, rejection == RefundReason.None, "the lens foresaw it");
+            if (!filled) {
+                assertEq(uint8(rejection), uint8(RefundReason.LossLimit));
+                ++refused;
+                blocked = true;
+                // a smaller lot may still fit under the limit (at 30% the first lot of a cycle is
+                // what gets refused once the swings have taken the house near the floor); the
+                // gang takes it, so that it holds something to sell while buys are blocked
+                for (uint256 small = cap / 5; small >= cap / 500; small /= 10) {
+                    if (_tryTrade(gang, HIGHER, true, small, low)) break;
+                }
+                break;
+            }
+            (uint256 afterBuy, uint256 limitFloor) = lens.lossLimit(roundId);
+            assertEq(limitFloor, floor);
+            assertGe(afterBuy, floor, "every buy that fills leaves the house 70% of its capital");
+            if (afterBuy < lowest) lowest = afterBuy;
+        }
     }
 
     function _assertCovered() internal view {

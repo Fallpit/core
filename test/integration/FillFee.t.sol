@@ -37,12 +37,13 @@ contract FillFeeTest is IntegrationFixture {
     // the parameter
     // --------------------------------------------------------------------------------------------
 
-    /// @dev Default 0.0001 ETH: a fill of about 3.5M gas at the chain's 0.02 gwei with a 30% margin. The
-    ///      round freezes it at open, the commit carries it, and the lens quotes it.
+    /// @dev Default 0.000025 ETH: a later fill (about 1.1M gas) at the chain's 0.02 gwei, with a little to
+    ///      spare; a batched fill costs about half of that. The round freezes it at open, the commit carries
+    ///      it, and the lens quotes it.
     function test_fillFee_default_frozenPerRound_quotedByTheLens() public {
         assertEq(book.defaultParams().fillFee, FILL_FEE);
-        assertEq(FILL_FEE, 0.0001 ether);
-        assertGe(FILL_FEE, uint256(3_500_000) * 0.02 gwei * 130 / 100, "covers 3.5M gas plus 30%");
+        assertEq(FILL_FEE, 0.000025 ether);
+        assertGe(FILL_FEE, uint256(1_100_000) * 0.02 gwei, "covers a later fill at 0.02 gwei");
         _open();
         assertEq(hook.getConfig(roundId).params.fillFee, FILL_FEE);
         (,,,,,, uint64 contextFee,) = hook.commitContext(roundId, 2);

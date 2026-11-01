@@ -9,7 +9,6 @@ import {FallpitHook} from "../../src/FallpitHook.sol";
 import {FallpitRouter} from "../../src/FallpitRouter.sol";
 import {Ticket, ticketsOf, ticketOf} from "../Ticket.sol";
 import {StandardMenu} from "../Menus.sol";
-import {LadderMath} from "../../src/LadderMath.sol";
 import {PitVault} from "../../src/PitVault.sol";
 import {PitOracle} from "../../src/PitOracle.sol";
 import {PitBook} from "../../src/hook/PitBook.sol";
@@ -38,7 +37,7 @@ contract OracleOwnerLimitsTest is Test, StandardMenu {
     uint256 internal constant CAPITAL = 1_000_000e18;
     uint256 internal constant LOT = 20_000e18;
     /// @dev The book's default fill fee: what every commit carries.
-    uint256 internal constant FILL_FEE = 0.0001 ether;
+    uint256 internal constant FILL_FEE = 0.000025 ether;
 
     PoolManager internal pm;
     FallpitRouter internal router;
@@ -78,7 +77,7 @@ contract OracleOwnerLimitsTest is Test, StandardMenu {
             "FallpitHook.sol:FallpitHook",
             abi.encode(
                 address(router),
-                address(new LadderMath()),
+                deployCode("LadderMath.sol:LadderMath"),
                 address(oracle),
                 address(vault),
                 address(guard),
@@ -237,9 +236,8 @@ contract OracleOwnerLimitsTest is Test, StandardMenu {
     ///      take it from just anyone, and never books the gap to yesterday's close as one daily return.
     function test_recordClose_refusesAMonthsOldPrint_andNeverBooksTheGapAsOneReturn() public {
         bytes32 gme = bytes32("GME");
-        bytes32 gmeFeed = bytes32(uint256(0x6de));
         PitOracle.TickerConfig memory cfg;
-        cfg.pythFeedId = gmeFeed;
+        cfg.pythFeedId = bytes32(uint256(0x6de));
         vm.prank(oracleOwner);
         oracle.setTicker(gme, cfg);
         // registered a day ago (a new ticker is in force 24 hours after its registration)
@@ -260,20 +258,25 @@ contract OracleOwnerLimitsTest is Test, StandardMenu {
         uint64 oldClose = NYTime.closeTs(june1);
         uint64 close0 = NYTime.closeTs(day0);
         assertGt(close0 - oldClose, 120 days);
-        bytes memory oldReport =
-            abi.encodePacked(uint8(0x01), pyth.encode(gmeFeed, 20e5, 100, -5, oldClose, oldClose - 1));
-        bytes memory newReport =
-            abi.encodePacked(uint8(0x01), pyth.encode(gmeFeed, 27e5, 100, -5, close0, close0 - 1));
-        // the oracle itself has no notion of "old"
-        (uint256 oldPrice,,) = oracle.verifyAt(gme, oldClose, oldReport);
-        assertEq(oldPrice, 20e18);
+        {
+            bytes memory oldReport = abi.encodePacked(
+                uint8(0x01), pyth.encode(cfg.pythFeedId, 20e5, 100, -5, oldClose, oldClose - 1)
+            );
+            bytes memory newReport =
+                abi.encodePacked(uint8(0x01), pyth.encode(cfg.pythFeedId, 27e5, 100, -5, close0, close0 - 1));
+            // the oracle itself has no notion of "old"
+            {
+                (uint256 oldPrice,,) = oracle.verifyAt(gme, oldClose, oldReport);
+                assertEq(oldPrice, 20e18);
+            }
 
-        vm.startPrank(eve);
-        vm.expectRevert(IPitBook.CloseTooOld.selector);
-        book.recordClose(gme, june1, oldReport);
-        book.recordClose(gme, day0, newReport);
-        vm.stopPrank();
-        assertEq(book.getTicker(gme).varWad, 0.0004e18, "the first close is no return");
+            vm.startPrank(eve);
+            vm.expectRevert(IPitBook.CloseTooOld.selector);
+            book.recordClose(gme, june1, oldReport);
+            book.recordClose(gme, day0, newReport);
+            vm.stopPrank();
+            assertEq(book.getTicker(gme).varWad, 0.0004e18, "the first close is no return");
+        }
 
         // seeded by the owner in date order instead, the 30% gap is still not one daily return
         bytes32 amc = bytes32("AMC");

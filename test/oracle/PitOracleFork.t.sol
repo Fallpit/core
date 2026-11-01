@@ -137,10 +137,13 @@ contract PitOracleForkTest is OracleTestBase {
         uint64 ts = uint64(updatedAt + 5);
         PitOracle.Print memory p =
             PitOracle.Print({ticker: ticker, price: underlying * 1005 / 1000, ts: ts, prevTs: ts - 1});
-        (uint256 price, uint64 gotTs, bool trustless) = oracle.verifyAt(ticker, ts, _report2(oracle, p, 0, 1));
-        assertEq(price, p.price);
-        assertEq(gotTs, ts);
-        assertFalse(trustless);
+        {
+            (uint256 price, uint64 gotTs, bool trustless) =
+                oracle.verifyAt(ticker, ts, _report2(oracle, p, 0, 1));
+            assertEq(price, p.price);
+            assertEq(gotTs, ts);
+            assertFalse(trustless);
+        }
 
         // 0.8% away is outside the 60 bps bound.
         p.price = underlying * 1008 / 1000;
@@ -148,14 +151,18 @@ contract PitOracleForkTest is OracleTestBase {
         vm.expectRevert(abi.encodeWithSelector(PitOracle.OutOfBound.selector, p.price, underlying));
         oracle.verifyAt(ticker, ts, report);
 
-        // A print before this round is bounded by the previous round, found by walking back.
+        _checkPreviousRound(ticker, feed, multiplier);
+    }
+
+    /// @dev A print before the feed's latest round is bounded by the previous round, found by walking back.
+    function _checkPreviousRound(bytes32 ticker, address feed, uint256 multiplier) internal {
         (, int256 prevAnswer,, uint256 prevUpdatedAt,) = _previousRound(feed);
         if (prevUpdatedAt != 0) {
             uint256 prevUnderlying = uint256(prevAnswer) * 1e10 * 1e18 / multiplier;
             uint64 prevTs = uint64(prevUpdatedAt);
             PitOracle.Print memory old =
                 PitOracle.Print({ticker: ticker, price: prevUnderlying, ts: prevTs, prevTs: prevTs - 1});
-            (price,,) = oracle.verifyAt(ticker, prevTs, _report2(oracle, old, 0, 1));
+            (uint256 price,,) = oracle.verifyAt(ticker, prevTs, _report2(oracle, old, 0, 1));
             assertEq(price, prevUnderlying);
             emit log_named_decimal_uint("  previous round reference", prevUnderlying, 18);
         }

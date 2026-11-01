@@ -89,14 +89,14 @@ contract PitAttacker {
 ///         share. Used to show that the hook's own solvency check, not the math, is the last line.
 contract GiveawayMath is MockLadderMath {
     function fill(
-        int256[40] calldata v,
-        uint256[40] calldata,
+        int256[40] memory v,
+        uint256[40] memory,
         uint256,
-        Ctx calldata,
+        Ctx memory,
         uint8 lo,
         uint8 hi,
         int256 delta
-    ) external pure override returns (Fill memory f) {
+    ) public pure override returns (Fill memory f) {
         f.v = v;
         for (uint8 j = lo; j <= hi; ++j) {
             f.v[j] += delta;

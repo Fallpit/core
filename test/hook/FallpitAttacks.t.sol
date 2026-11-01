@@ -594,9 +594,11 @@ contract FallpitAttacksTest is HookFixture {
         assertTrue(a.fill(id, _printFor(id, S0)));
         assertEq(_state().held, c.capital + quoted, "the hook books exactly the cost it received");
         assertGe(tax.balanceOf(address(hook)), c.capital + quoted);
-        uint256 sent = 50_000e18 - tax.balanceOf(address(a));
-        assertGt(sent, quoted * 100 / 99, "the user bears the chip's tax on the way in");
-        assertLt(sent, quoted * 104 / 100);
+        {
+            uint256 sent = 50_000e18 - tax.balanceOf(address(a));
+            assertGt(sent, quoted * 100 / 99, "the user bears the chip's tax on the way in");
+            assertLt(sent, quoted * 104 / 100);
+        }
         assertEq(tax.balanceOf(address(router)), 0, "unused escrow went back");
         _assertHookSolvent(address(tax));
 
@@ -611,10 +613,12 @@ contract FallpitAttacksTest is HookFixture {
         // sell: the escrow is the product's tokens, so the commit is exact; proceeds arrive net of the tax
         a.approve(_token(HIGHER).id, address(router));
         uint256 before = tax.balanceOf(address(a));
-        (uint256 net,,,,,) = lens.quote(roundId, HIGHER, false, 4_000e18, S0, clock + 2);
-        id = a.commit(roundId, HIGHER, false, 4_000e18, 0);
-        assertTrue(a.fill(id, _printFor(id, S0)));
-        assertEq(tax.balanceOf(address(a)) - before, net - net / 100);
+        {
+            (uint256 net,,,,,) = lens.quote(roundId, HIGHER, false, 4_000e18, S0, clock + 2);
+            id = a.commit(roundId, HIGHER, false, 4_000e18, 0);
+            assertTrue(a.fill(id, _printFor(id, S0)));
+            assertEq(tax.balanceOf(address(a)) - before, net - net / 100);
+        }
         _assertSupplies();
         _assertHookSolvent(address(tax));
 
@@ -622,19 +626,23 @@ contract FallpitAttacksTest is HookFixture {
         _warp(NYTime.closeTs(day) + 5);
         book.recordClose(NVDA, day, oracle.post(NVDA, TRUSTLESS, S0 * 101 / 100, NYTime.closeTs(day)));
         hook.settleRound(taxHouse, day);
-        IFallpitHook.RoundState memory st = _state();
-        hook.finalizeRound(taxHouse, day);
-        uint256 back = st.held - st.payoutOwed - st.protocolFees;
-        assertEq(tax.balanceOf(address(vault)), back - back / 100);
-        assertEq(vault.roundCapital(taxHouse), back - back / 100);
+        {
+            IFallpitHook.RoundState memory st = _state();
+            hook.finalizeRound(taxHouse, day);
+            uint256 back = st.held - st.payoutOwed - st.protocolFees;
+            assertEq(tax.balanceOf(address(vault)), back - back / 100);
+            assertEq(vault.roundCapital(taxHouse), back - back / 100);
+        }
         before = tax.balanceOf(address(a));
         assertEq(a.redeem(_token(HIGHER).id, 6_000e18), 6_000e18);
         assertEq(tax.balanceOf(address(a)) - before, 5_940e18);
         hook.collectProtocolFees(address(tax));
 
-        (uint256 claims, uint256 owed) = Accounting.read(address(hook), address(tax));
-        assertEq(claims, 0);
-        assertEq(owed, 0);
+        {
+            (uint256 claims, uint256 owed) = Accounting.read(address(hook), address(tax));
+            assertEq(claims, 0);
+            assertEq(owed, 0);
+        }
         assertLe(tax.balanceOf(address(hook)), 4, "only gross-up dust is left in the hook");
         // nothing was created: every chip minted is somewhere or was burned as tax
         assertEq(
@@ -665,55 +673,60 @@ contract FallpitAttacksTest is HookFixture {
     ///      shallower, x takes less out per swing and the round never holds less than the holders paid.
     function test_attack_voidRefunds_neverExceedWhatTheRoundHolds() public {
         MockChip small = new MockChip(18);
-        bytes32 smallHouse = _fundHouse(address(small), 1_000e18);
-        IPitBook.Params memory p = book.defaultParams();
-        p.alpha = 0.3e18;
-        p.maxFillBps = 10_000;
-        p.lossLimitBps = 10_000;
-        p.floorCapBps = 10_000;
-        p.minPriceWad = 0;
-        p.menu = Menus.thresholds();
-        _setParams(p);
-        roundId = hook.openRound(NVDA, address(small), day);
-        house = smallHouse;
+        {
+            bytes32 smallHouse = _fundHouse(address(small), 1_000e18);
+            IPitBook.Params memory p = book.defaultParams();
+            p.alpha = 0.3e18;
+            p.maxFillBps = 10_000;
+            p.lossLimitBps = 10_000;
+            p.floorCapBps = 10_000;
+            p.minPriceWad = 0;
+            p.menu = Menus.thresholds();
+            _setParams(p);
+            roundId = hook.openRound(NVDA, address(small), day);
+            house = smallHouse;
+        }
 
         PitAttacker x = _attacker(address(small), 10_000e18);
         PitAttacker y = _attacker(address(small), 10_000e18);
         PitAttacker z = _attacker(address(small), 10_000e18);
-        uint256 low = S0 * 95 / 100;
-        uint256 high = S0 * 105 / 100;
+        {
+            uint256 low = S0 * 95 / 100;
+            uint256 high = S0 * 105 / 100;
 
-        // y buys the top HIGHER strike dear while the stock is up; z buys the opposite side dear when it
-        // is down. Both paid close to one chip per token.
-        _trade(y, 4, true, 300e18, high);
-        _trade(z, 5, true, 600e18, low);
-        // x rides the same swings on another token: buys LOWER@15 for little while the stock is up and
-        // sells it dear when the stock is down, again and again, until solvency stops the selling
-        for (uint256 trips; trips < 60; ++trips) {
-            uint256 id = _commit(x, 1, true, 900e18);
-            if (!x.fill(id, _printFor(id, high))) break;
-            id = _commit(x, 1, false, 900e18);
-            bool soldAll = x.fill(id, _printFor(id, low));
-            for (uint256 chunks; !soldAll && chunks < 9; ++chunks) {
-                id = _commit(x, 1, false, 100e18);
-                if (!x.fill(id, _printFor(id, low))) break;
+            // y buys the top HIGHER strike dear while the stock is up; z buys the opposite side dear when it
+            // is down. Both paid close to one chip per token.
+            _trade(y, 4, true, 300e18, high);
+            _trade(z, 5, true, 600e18, low);
+            // x rides the same swings on another token: buys LOWER@15 for little while the stock is up and
+            // sells it dear when the stock is down, again and again, until solvency stops the selling
+            for (uint256 trips; trips < 60; ++trips) {
+                uint256 id = _commit(x, 1, true, 900e18);
+                if (!x.fill(id, _printFor(id, high))) break;
+                id = _commit(x, 1, false, 900e18);
+                bool soldAll = x.fill(id, _printFor(id, low));
+                for (uint256 chunks; !soldAll && chunks < 9; ++chunks) {
+                    id = _commit(x, 1, false, 100e18);
+                    if (!x.fill(id, _printFor(id, low))) break;
+                }
+                (uint256 worst, uint256 covered) = lens.solvency(roundId);
+                assertLe(worst, covered, "payouts stay covered throughout");
+                if (!soldAll) break;
             }
-            (uint256 worst, uint256 covered) = lens.solvency(roundId);
-            assertLe(worst, covered, "payouts stay covered throughout");
-            if (!soldAll) break;
         }
         assertGt(small.balanceOf(address(x)), 10_000e18, "x took chips out of the round");
 
-        (uint256[12] memory supply, uint256[12] memory premium) = hook.getSupplies(roundId);
+        (uint256[15] memory supply, uint256[15] memory premium) = hook.getSupplies(roundId);
         IFallpitHook.RoundState memory st = _state();
-        uint256 costBasis = premium[1] + premium[4] + premium[5];
-        assertGt(costBasis, st.held, "scenario: the holders' cost exceeds what the round still holds");
+        {
+            uint256 costBasis = premium[1] + premium[4] + premium[5];
+            assertGt(costBasis, st.held, "scenario: the holders' cost exceeds what the round still holds");
+        }
         assertLt(st.held, 1_000e18, "scenario: the round holds less than the house brought");
 
         _warp(NYTime.closeTs(day) + 24 hours + 1);
         hook.voidRound(house, day);
-        IFallpitHook.RoundState memory voided = _state();
-        assertEq(voided.payoutOwed, 0, "nothing is above the house's capital: no refunds");
+        assertEq(_state().payoutOwed, 0, "nothing is above the house's capital: no refunds");
         assertEq(small.balanceOf(address(vault)), st.held, "the house takes all the round still holds");
         assertFalse(vault.isLocked(house));
 
@@ -742,7 +755,7 @@ contract FallpitAttacksTest is HookFixture {
         uint256 eveGot = _eveSell(HIGHER, 5_000e18, high);
         assertGt(eveGot, evePaid, "scenario: eve realised a gain");
         IFallpitHook.RoundState memory st = _state();
-        (, uint256[12] memory premium) = hook.getSupplies(roundId);
+        (, uint256[15] memory premium) = hook.getSupplies(roundId);
         assertEq(premium[F3], alicePaid);
         assertEq(premium[LOWER], bobPaid);
         uint256 above = st.held - HOUSE_CAPITAL;
@@ -781,7 +794,7 @@ contract FallpitAttacksTest is HookFixture {
         _open();
         uint256 cost = _eveBuy(HIGHER, 10_000e18, S0);
         uint256 proceeds = _eveSell(HIGHER, 6_000e18, S0);
-        (, uint256[12] memory premium) = hook.getSupplies(roundId);
+        (, uint256[15] memory premium) = hook.getSupplies(roundId);
         assertLe(premium[HIGHER], cost * 4_000 / 10_000, "the sold shares took their average cost with them");
         _warp(NYTime.closeTs(day) + 24 hours + 1);
         hook.voidRound(house, day);
@@ -813,7 +826,7 @@ contract FallpitAttacksTest is HookFixture {
         for (uint256 i; i < 6; ++i) {
             paid += _eveBuy(HIGHER, 400_000e18, S0);
             got += _eveSell(HIGHER, 400_000e18, S0);
-            (, uint256[12] memory basis) = hook.getSupplies(roundId);
+            (, uint256[15] memory basis) = hook.getSupplies(roundId);
             assertLe(
                 basis[HIGHER], paid - got, "the cost basis never exceeds the net cash paid for the token"
             );
@@ -918,10 +931,14 @@ contract FallpitAttacksTest is HookFixture {
     // reentrancy through a malicious chip
     // --------------------------------------------------------------------------------------------
 
+    /// @dev The hook's own `fill` of a HIGHER buy, as a chip posing as the router would call it.
+    function _hookFillCall(address user, uint64 t, bytes memory report) internal view returns (bytes memory) {
+        return abi.encodeCall(hook.fill, (roundId, HIGHER, true, 5_000e18, 100_000e18, user, t, report));
+    }
+
     function test_attack_reentrancyThroughMaliciousChip() public {
         ReentrantChip evil = new ReentrantChip();
-        bytes32 evilHouse = _fundHouse(address(evil), 1_000_000e18);
-        house = evilHouse;
+        house = _fundHouse(address(evil), 1_000_000e18);
         uint256 attempts;
 
         // openRound: while the capital moves vault -> hook the chip tries to open again
@@ -941,28 +958,27 @@ contract FallpitAttacksTest is HookFixture {
 
         // commit: while the escrow moves user -> router the chip tries to commit and to fill
         evil.arm(address(router), abi.encodeCall(router.commit, (roundId, HIGHER, true, 1e18, 1e18)));
-        uint256 id1 = _commitBuy(alice, HIGHER, 5_000e18, 100_000e18);
-        attempts = _assertBlocked(evil, attempts, IFallpitRouter.Reentrancy.selector);
-        evil.disarm();
-        uint256 id2 = _commitBuy(bob, HIGHER, 5_000e18, 100_000e18);
-        uint64 t = router.getCommit(id1).fillTs;
-        _warp(t);
-        bytes memory report = _report(t, S0);
+        {
+            uint256 id1 = _commitBuy(alice, HIGHER, 5_000e18, 100_000e18);
+            attempts = _assertBlocked(evil, attempts, IFallpitRouter.Reentrancy.selector);
+            evil.disarm();
+            uint256 id2 = _commitBuy(bob, HIGHER, 5_000e18, 100_000e18);
+            uint64 t = router.getCommit(id1).fillTs;
+            _warp(t);
+            bytes memory report = _report(t, S0);
 
-        // fill: while the cost moves router -> hook the chip tries to fill the other commit ...
-        evil.arm(address(router), abi.encodeCall(router.fill, (id2, report)));
-        vm.prank(keeper);
-        assertTrue(router.fill(id1, report));
-        attempts = _assertBlocked(evil, attempts, IFallpitRouter.Reentrancy.selector);
-        // ... and to call the hook's fill itself while the router's escrow moves to the hook, posing as the
-        // router (only the router may fill)
-        evil.arm(
-            address(hook),
-            abi.encodeCall(hook.fill, (roundId, HIGHER, true, 5_000e18, 100_000e18, address(evil), t, report))
-        );
-        vm.prank(keeper);
-        assertTrue(router.fill(id2, report));
-        attempts = _assertBlocked(evil, attempts, IFallpitHook.OnlyRouter.selector);
+            // fill: while the cost moves router -> hook the chip tries to fill the other commit ...
+            evil.arm(address(router), abi.encodeCall(router.fill, (id2, report)));
+            vm.prank(keeper);
+            assertTrue(router.fill(id1, report));
+            attempts = _assertBlocked(evil, attempts, IFallpitRouter.Reentrancy.selector);
+            // ... and to call the hook's fill itself while the router's escrow moves to the hook, posing as the
+            // router (only the router may fill)
+            evil.arm(address(hook), _hookFillCall(address(evil), t, report));
+            vm.prank(keeper);
+            assertTrue(router.fill(id2, report));
+            attempts = _assertBlocked(evil, attempts, IFallpitHook.OnlyRouter.selector);
+        }
         assertEq(_token(HIGHER).totalSupply(), 10_000e18, "exactly the two fills minted");
 
         // sell: while the proceeds move hook -> user the chip tries to refund a pending commit
@@ -1032,7 +1048,7 @@ contract FallpitAttacksTest is HookFixture {
         for (uint256 j; j < 40; ++j) {
             assertEq(v[j], 0);
         }
-        (uint256[12] memory supply, uint256[12] memory premium) = hook.getSupplies(roundId);
+        (uint256[15] memory supply, uint256[15] memory premium) = hook.getSupplies(roundId);
         for (uint256 i; i < MAX_PRODUCTS; ++i) {
             assertEq(supply[i], 0);
             assertEq(premium[i], 0);

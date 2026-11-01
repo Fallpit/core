@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {ERC6909} from "solady/tokens/ERC6909.sol";
 import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
+import {SafeCastLib} from "solady/utils/SafeCastLib.sol";
 import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
 
 import {IFallpitHook, RefundReason} from "./interfaces/IFallpitHook.sol";
@@ -11,20 +12,13 @@ import {IPitOracle} from "./interfaces/IPitOracle.sol";
 import {IPitVault} from "./interfaces/IPitVault.sol";
 import {IChipGuard} from "./interfaces/IChipGuard.sol";
 import {IPitBook} from "./hook/IPitBook.sol";
-import {NYTime} from "./lib/NYTime.sol";
 import {PackedBands} from "./lib/PackedBands.sol";
 import {PitMath} from "./hook/PitMath.sol";
-import {PitClock} from "./hook/PitClock.sol";
-
-/// @dev What the hook reads from a chip directly.
-interface IChipDecimals {
-    function decimals() external view returns (uint8);
-    function balanceOf(address owner) external view returns (uint256);
-}
+import {HouseBands, OpenDeps, Round, RoundLogic, StoredState} from "./hook/RoundLogic.sol";
 
 /// @title FallpitHook
-/// @notice The Fallpit daily stock-close game. Every round is a menu of products (up to twelve: floors
-///         of the close and the HIGHER / LOWER pair), each an ERC-6909 ticket of this contract on a run of
+/// @notice The Fallpit daily stock-close game. Every round is a menu of products (up to twelve at the open:
+///         floors of the close and the HIGHER / LOWER pair; up to fifteen with its live strikes), each an ERC-6909 ticket of this contract on a run of
 ///         bands (id = round id | product index, `tokenId`), all priced from one joint band state by
 ///         `ILadderMath`. See contracts/SPEC.md section 7.
 /// @dev The chips of every round sit in this contract. `chipOwed` is what it must hold per chip: every
@@ -41,26 +35,28 @@ contract FallpitHook is IFallpitHook, ERC6909 {
     using FixedPointMathLib for uint256;
     using SafeTransferLib for address;
 
-    /// @dev One round: frozen config, pricing state and the supply and premium of each product of its menu
-    ///      (`cfg.params.menu`; the entries above the last product stay zero). `v` is the band state of
-    ///      `ILadderMath` packed two bands to a word (`PackedBands`). The packing is exact: `ILadderMath`
-    ///      rejects any |v_j| above 1e36 on the way in and on the way out, and 1e36 < 2^127.
-    struct Round {
-        RoundConfig cfg;
-        RoundState st;
-        uint256[12] supply;
-        uint256[12] premium;
-        uint256[20] v;
+    /// @dev One fill being priced (`_fill`): the round, the product index, the side, the ticket count, the
+    ///      trader and the commit instant, then the price and time of the print for that instant.
+    struct Order {
+        bytes32 roundId;
+        uint8 index;
+        bool isBuy;
+        uint256 shares;
+        address user;
+        uint64 t;
+        uint256 price;
+        uint64 ts;
     }
 
     uint256 private constant WAD = 1e18;
     uint256 private constant BPS = 10_000;
     /// @dev A round with no recorded close can be voided this long after its close.
-    uint64 private constant VOID_AFTER = 24 hours;
     /// @dev The low byte of a round id, where a ticket id carries its product index.
     uint256 private constant INDEX_MASK = 0xff;
     /// @dev Transient slot of the reentrancy lock ("FallpitLock").
     uint256 private constant LOCK_SLOT = 0x46616c6c7069744c6f636b;
+    /// @dev Transient slot of the hook's own ETH at the start of a fill ("FallpitKept").
+    uint256 private constant KEPT_SLOT = 0x46616c6c7069744b657074;
 
     /// @inheritdoc IFallpitHook
     address public immutable router;
@@ -84,8 +80,9 @@ contract FallpitHook is IFallpitHook, ERC6909 {
     ///      house trades, and settling, finalizing, voiding and redeeming never read the depths; so an older
     ///      round's depths are not kept (`getCurve` returns zero depths for it).
     mapping(bytes32 house => uint256[10] packed) internal _lnInv;
-    /// @dev The learned sigma of a round (`setSigmaEff`); zero until the first update.
-    mapping(bytes32 roundId => uint256) internal _sigmaEff;
+    /// @dev The pricing state of each house's latest traded round (`RoundLogic.HouseBands`): an older
+    ///      round's state is not kept (`getCurve` returns the zero state for it once the next round traded).
+    mapping(bytes32 house => HouseBands) internal _bands;
 
     modifier onlyRouter() {
         if (msg.sender != router) revert OnlyRouter();
@@ -121,9 +118,12 @@ contract FallpitHook is IFallpitHook, ERC6909 {
         book = book_;
     }
 
-    /// @notice Accepts ETH to pay oracle update fees on fills (today the fee is 0). The oracle's refunds
-    ///         land here and pay for later fills. Nobody can withdraw it.
-    receive() external payable {}
+    /// @notice Accepts the oracle's refunds only. A fill or a strike sends the oracle its own `msg.value`,
+    ///         and what comes back goes to the filler or the caller in the same call, so the hook keeps no
+    ///         ETH; ETH from anyone else would have no way out.
+    receive() external payable {
+        if (msg.sender != address(oracle)) revert EthNotAccepted();
+    }
 
     // ------------------------------------------------------------------------------------------------
     // Fills and escrow
@@ -142,23 +142,42 @@ contract FallpitHook is IFallpitHook, ERC6909 {
     ) external payable onlyRouter nonReentrant returns (uint256 chips) {
         if (shares == 0 || shares > uint128(type(int128).max)) revert ZeroAmount();
         address chip = _rounds[roundId].cfg.chip;
-        uint256 id = tokenId(roundId, product);
+        {
+            // transient: the hook's own ETH before this call, so only this call's spare ETH goes back
+            uint256 kept = address(this).balance - msg.value;
+            assembly ("memory-safe") {
+                tstore(KEPT_SLOT, kept)
+            }
+        }
+        Order memory o = Order(roundId, product, isBuy, shares, user, t, 0, 0);
         if (isBuy) {
             // the router sent the escrow first: it must be here on top of what is owed already
             // a low-level read: a chip's own revert data never comes out of a fill (it could pose as a final
             // rejection); a failed read counts as nothing here, so the fill is not final either
             if (SafeTransferLib.balanceOf(chip, address(this)) < chipOwed[chip] + limit) revert ChipShort();
-            uint256 fee;
-            (chips, fee) = _fill(roundId, product, true, shares, user, t, report);
+            (chips,) = _fill(o, report);
             if (chips > limit) revert FillRejected(uint8(RefundReason.Limit));
-            _mint(user, id, shares);
+            _mint(user, tokenId(roundId, product), shares);
             if (limit > chips) chip.safeTransfer(user, limit - chips);
         } else {
-            (chips,) = _fill(roundId, product, false, shares, user, t, report);
+            (chips,) = _fill(o, report);
             if (chips < limit) revert FillRejected(uint8(RefundReason.Limit));
-            _burn(router, id, shares);
+            _burn(router, tokenId(roundId, product), shares);
             if (chips != 0) chip.safeTransfer(user, chips);
         }
+        // the filler's ETH above the oracle's fee goes back through the router (msg.value only paid the
+        // oracle; the hook's own ETH stays out of it)
+        _returnEth();
+    }
+
+    /// @dev Sends the router what the oracle sent back of this call's ETH.
+    function _returnEth() private {
+        uint256 back = address(this).balance;
+        uint256 kept;
+        assembly ("memory-safe") {
+            kept := tload(KEPT_SLOT)
+        }
+        if (back > kept) router.safeTransferETH(back - kept);
     }
 
     /// @inheritdoc IFallpitHook
@@ -184,92 +203,55 @@ contract FallpitHook is IFallpitHook, ERC6909 {
         nonReentrant
         returns (bytes32 roundId)
     {
-        (
-            uint256 s0,
-            uint256 sigma,
-            IPitBook.RoundClock memory clock,
-            IPitBook.FillSource fillSource,
-            IPitBook.Params memory p
-        ) = book.openTerms(ticker, day);
-        uint64 closeAt = NYTime.closeTs(day);
-        if (block.timestamp >= closeAt - PitClock.CUTOFF_LEAD) revert TooLate();
-        (bool allowed,) = chipGuard.check(chip);
-        if (!allowed) revert ChipNotAllowed();
-        uint8 chipDecimals = IChipDecimals(chip).decimals();
-        if (chipDecimals > 18) revert ChipNotAllowed();
+        return RoundLogic.start(
+            _rounds,
+            houseRound,
+            chipOwed,
+            _lnInv,
+            OpenDeps({book: book, chipGuard: chipGuard, vault: vault, math: math}),
+            ticker,
+            chip,
+            day
+        );
+    }
 
-        bytes32 house = houseOf(ticker, chip);
-        {
-            bytes32 previous = houseRound[house];
-            if (previous != bytes32(0)) {
-                Round storage pr = _rounds[previous];
-                Status s = pr.st.status;
-                if (s == Status.Open) {
-                    (uint256 price,,) = book.closeState(ticker, pr.cfg.day);
-                    if (price != 0 || block.timestamp <= pr.cfg.closeTs + PitClock.MISSED_CLOSE) {
-                        revert PreviousRoundActive();
-                    }
-                    _void(pr, previous);
-                } else if (s == Status.Settled) {
-                    revert PreviousRoundActive();
-                }
-            }
-        }
-        roundId = roundIdOf(house, day);
+    /// @inheritdoc IFallpitHook
+    /// @dev The print is checked as a fill's is (the oracle's print for `t`, the round's fill source); the
+    ///      rules are in `RoundLogic.openStrike`.
+    function openStrike(bytes32 roundId, uint8 m, uint64 t, bytes calldata report)
+        external
+        payable
+        nonReentrant
+    {
         Round storage r = _rounds[roundId];
-        if (r.st.status != Status.None) revert RoundExists();
-
-        // Everything that does not depend on the capital is written before the capital is pulled.
-        houseRound[house] = roundId;
-        r.st.status = Status.Open;
-        r.st.g = WAD;
-        RoundConfig storage c = r.cfg;
-        c.ticker = ticker;
-        c.house = house;
-        c.chip = chip;
-        c.day = day;
-        c.decimals = chipDecimals;
-        c.fillSource = fillSource;
-        c.openTs = uint64(block.timestamp);
-        c.closeTs = closeAt;
-        c.cutoff = closeAt - PitClock.CUTOFF_LEAD;
-        c.clock = clock;
-        c.s0 = s0;
-        c.sigma = sigma;
-        c.params = p;
-
-        // Pull the house capital; L is what actually arrived.
-        uint256 before = IChipDecimals(chip).balanceOf(address(this));
-        vault.pullRoundCapital(house, address(this));
-        uint256 capital = IChipDecimals(chip).balanceOf(address(this)) - before;
-        if (capital < uint256(p.minCapital) * 10 ** chipDecimals) revert CapitalTooLow();
-        c.capital = capital;
-        c.maxFill = capital * p.maxFillBps / BPS;
-        r.st.held = capital;
-        chipOwed[chip] += capital;
-        // the depths are checked here and derived again at each fill (`_depthsOf`)
-        uint256[10] memory packed = math.openLnInv(sigma);
-        math.depths(packed, capital * 10 ** (18 - chipDecimals), p.alpha);
-        _lnInv[house] = packed;
-
-        emit RoundOpened(roundId, ticker, chip, day, s0, sigma, capital, p.menu);
+        if (r.st.status != Status.Open) revert WrongStatus();
+        {
+            // the instant is at most the refund window and at most STRIKE_MAX_LAG old
+            uint256 lag = r.cfg.params.refundDelay;
+            if (lag > PitMath.STRIKE_MAX_LAG) lag = PitMath.STRIKE_MAX_LAG;
+            if (t > block.timestamp || block.timestamp > uint256(t) + lag) revert FillExpired();
+        }
+        uint256 sigmaEff = sigmaEffOf(roundId);
+        // the caller pays the oracle's fee: the hook's own ETH stays out of it, and what the oracle does not
+        // spend goes back to the caller
+        uint256 kept = address(this).balance - msg.value;
+        (uint256 price, uint64 ts) = _verify(r.cfg, t, report, msg.value);
+        RoundLogic.openStrike(r, roundId, m, price, ts, sigmaEff, book);
+        if (address(this).balance > kept) msg.sender.safeTransferETH(address(this).balance - kept);
     }
 
     /// @inheritdoc IFallpitHook
     /// @dev The book checks the caller and the rate and applies the bounds (`PitBook.stepSigmaEff`); the hook
     ///      keeps the result for its fills. An update moves prices with no trade, as the clock does.
     function setSigmaEff(bytes32 roundId, uint256 sigmaEff) external {
-        Round storage r = _rounds[roundId];
-        if (r.st.status != Status.Open) revert WrongStatus();
-        sigmaEff = book.stepSigmaEff(msg.sender, roundId, r.cfg.sigma, sigmaEff);
-        _sigmaEff[roundId] = sigmaEff;
-        emit SigmaEffSet(roundId, sigmaEff);
+        RoundLogic.setSigmaEff(_rounds[roundId], roundId, sigmaEff, book);
     }
 
     /// @inheritdoc IFallpitHook
     function sigmaEffOf(bytes32 roundId) public view returns (uint256) {
-        uint256 s = _sigmaEff[roundId];
-        return s == 0 ? _rounds[roundId].cfg.sigma : s;
+        Round storage r = _rounds[roundId];
+        uint256 s = r.st.sigmaEff;
+        return s == 0 ? r.cfg.sigma : s;
     }
 
     /// @inheritdoc IFallpitHook
@@ -278,29 +260,7 @@ contract FallpitHook is IFallpitHook, ERC6909 {
     ///      again only after its close was replaced by a trustless print.
     function settleRound(bytes32 house, uint32 day) external nonReentrant {
         bytes32 roundId = roundIdOf(house, day);
-        Round storage r = _rounds[roundId];
-        RoundConfig storage c = r.cfg;
-        RoundState storage st = r.st;
-        Status s = st.status;
-        if (s != Status.Open && s != Status.Settled) revert WrongStatus();
-        (uint256 price, bool trustless,) = book.closeState(c.ticker, day);
-        if (price == 0) revert CloseNotRecorded();
-        if (s == Status.Settled) {
-            if (price == st.settledPrice && trustless == st.settledTrustless) revert AlreadySettled();
-        } else {
-            st.settledAt = uint64(block.timestamp);
-        }
-
-        uint8 band = math.bandOf(c.sigma, FixedPointMathLib.lnWad(int256(price.divWad(c.s0))));
-        uint16 mask = PitMath.winners(c.params.menu, band);
-        uint256 payout = PitMath.payoutOf(r.supply, mask);
-        st.status = Status.Settled;
-        st.closeBand = band;
-        st.winners = mask;
-        st.payoutOwed = payout;
-        st.settledPrice = price;
-        st.settledTrustless = trustless;
-        emit RoundSettled(roundId, price, band, mask, payout, trustless);
+        RoundLogic.settle(_rounds[roundId], roundId, day, book);
     }
 
     /// @inheritdoc IFallpitHook
@@ -309,32 +269,7 @@ contract FallpitHook is IFallpitHook, ERC6909 {
     ///      and the protocol fees as claims and sends the rest to the vault.
     function finalizeRound(bytes32 house, uint32 day) external nonReentrant {
         bytes32 roundId = roundIdOf(house, day);
-        Round storage r = _rounds[roundId];
-        RoundConfig storage c = r.cfg;
-        RoundState storage st = r.st;
-        if (st.status != Status.Settled) revert WrongStatus();
-        (uint256 price, bool trustless, uint64 disputeEnd) = book.closeState(c.ticker, day);
-        if (price != st.settledPrice) revert CloseChanged();
-        if (
-            !trustless
-                && (block.timestamp < st.settledAt + c.params.challengeWindow || block.timestamp < disputeEnd)
-        ) {
-            revert ChallengeWindowOpen();
-        }
-
-        uint256 payout = st.payoutOwed;
-        uint256 fees = st.protocolFees;
-        uint256 back = st.held - payout - fees;
-        st.status = Status.Final;
-        st.held = payout;
-        st.protocolFees = 0;
-        address chip = c.chip;
-        protocolFeesAccrued[chip] += fees;
-        chipOwed[chip] -= back;
-
-        _pay(chip, address(vault), back);
-        vault.returnRoundCapital(house);
-        emit RoundFinalized(roundId, payout, fees, back);
+        RoundLogic.finalize(_rounds[roundId], roundId, house, day, book, vault, protocolFeesAccrued, chipOwed);
     }
 
     /// @inheritdoc IFallpitHook
@@ -350,11 +285,7 @@ contract FallpitHook is IFallpitHook, ERC6909 {
     ///      paid.
     function voidRound(bytes32 house, uint32 day) external nonReentrant {
         bytes32 roundId = roundIdOf(house, day);
-        Round storage r = _rounds[roundId];
-        if (r.st.status != Status.Open) revert WrongStatus();
-        (uint256 price,,) = book.closeState(r.cfg.ticker, day);
-        if (block.timestamp <= r.cfg.closeTs + VOID_AFTER || price != 0) revert VoidNotAllowed();
-        _void(r, roundId);
+        RoundLogic.voidRound(_rounds[roundId], roundId, day, book, vault, chipOwed);
     }
 
     /// @inheritdoc IFallpitHook
@@ -371,19 +302,7 @@ contract FallpitHook is IFallpitHook, ERC6909 {
         (bytes32 roundId, uint8 index) = tokenRef(id);
         Round storage r = _rounds[roundId];
         if (r.st.status == Status.None || index >= PitMath.count(r.cfg.params.menu)) revert UnknownToken();
-        RoundState storage st = r.st;
-        if (st.status == Status.Final) {
-            if (st.winners >> index & 1 == 0) revert NotWinner();
-            payout = amount;
-        } else if (st.status == Status.Void) {
-            payout = r.premium[index].fullMulDiv(amount, r.supply[index]);
-            r.premium[index] -= payout;
-        } else {
-            revert WrongStatus();
-        }
-        r.supply[index] -= amount;
-        st.held -= payout;
-        st.payoutOwed -= payout;
+        payout = RoundLogic.redeem(r, index, amount);
         address chip = r.cfg.chip;
         chipOwed[chip] -= payout;
 
@@ -394,13 +313,7 @@ contract FallpitHook is IFallpitHook, ERC6909 {
 
     /// @inheritdoc IFallpitHook
     function collectProtocolFees(address chip) external nonReentrant returns (uint256 amount) {
-        address to = book.feeRecipient();
-        if (to == address(0)) revert ZeroAddress();
-        amount = protocolFeesAccrued[chip];
-        protocolFeesAccrued[chip] = 0;
-        chipOwed[chip] -= amount;
-        _pay(chip, to, amount);
-        emit ProtocolFeesCollected(chip, to, amount);
+        return RoundLogic.collectProtocolFees(chip, book, protocolFeesAccrued, chipOwed);
     }
 
     // ------------------------------------------------------------------------------------------------
@@ -469,24 +382,45 @@ contract FallpitHook is IFallpitHook, ERC6909 {
 
     /// @inheritdoc IFallpitHook
     function getState(bytes32 roundId) external view returns (RoundState memory) {
-        return _rounds[roundId].st;
+        StoredState storage t = _rounds[roundId].st;
+        return RoundState({
+            status: t.status,
+            settledTrustless: t.settledTrustless,
+            closeBand: t.closeBand,
+            winners: t.winners,
+            settledAt: t.settledAt,
+            g: t.g,
+            held: t.held,
+            protocolFees: t.protocolFees,
+            payoutOwed: t.payoutOwed,
+            settledPrice: t.settledPrice
+        });
     }
 
     /// @inheritdoc IFallpitHook
     function getSupplies(bytes32 roundId)
         external
         view
-        returns (uint256[12] memory supply, uint256[12] memory premium)
+        returns (uint256[15] memory supply, uint256[15] memory premium)
     {
         Round storage r = _rounds[roundId];
-        return (r.supply, r.premium);
+        for (uint256 i; i < PitMath.MAX_PRODUCTS; ++i) {
+            (supply[i], premium[i]) = (r.supply[i], r.premium[i]);
+        }
+    }
+
+    /// @inheritdoc IFallpitHook
+    function seedOf(bytes32 roundId) external view returns (int256) {
+        HouseBands storage b = _bands[_rounds[roundId].cfg.house];
+        return b.tag == _bandTag(roundId) ? b.lambda : int256(0);
     }
 
     /// @inheritdoc IFallpitHook
     function getCurve(bytes32 roundId) external view returns (int256[40] memory v, uint256[40] memory b0) {
         Round storage r = _rounds[roundId];
         if (r.st.status != Status.None && houseRound[r.cfg.house] == roundId) b0 = _depthsOf(r.cfg);
-        return (PackedBands.load(r.v), b0);
+        HouseBands storage hb = _bands[r.cfg.house];
+        if (hb.tag == _bandTag(roundId)) v = PackedBands.load(hb.v);
     }
 
     /// @notice ERC-6909 metadata: one name for every ticket; the id says which round and product.
@@ -514,137 +448,203 @@ contract FallpitHook is IFallpitHook, ERC6909 {
 
     /// @dev Prices one fill and writes the round's new state. Returns the chips the trader pays (buy) or
     ///      receives (sell) and the fee inside them.
-    function _fill(
-        bytes32 roundId,
-        uint8 index,
-        bool isBuy,
-        uint256 shares,
-        address user,
-        uint64 t,
-        bytes calldata report
-    ) private returns (uint256 chips, uint256 fee) {
-        Round storage r = _rounds[roundId];
-        RoundConfig storage c = r.cfg;
-        RoundState storage st = r.st;
-        address chip = c.chip;
+    function _fill(Order memory o, bytes calldata report) private returns (uint256 chips, uint256 fee) {
+        Round storage r = _rounds[o.roundId];
+        ILadderMath.PackedFill memory f;
+        {
+            (uint8 lo, uint8 hi) = _checkFill(r, o);
+            uint256 rho;
+            (o.price, o.ts, rho) = _print(r.cfg, o.t, report);
+            f = _engine(r, o, lo, hi, rho);
+        }
+        (chips, fee) = _account(r, o, f);
+        emit Filled(o.roundId, o.user, o.index, o.isBuy, o.shares, chips, fee, o.price, o.ts);
+    }
 
-        if (index >= PitMath.count(c.params.menu)) revert UnknownToken();
-        (uint8 lo, uint8 hi) = PitMath.run(c.params.menu, index);
-        if (st.status != Status.Open) revert FillRejected(uint8(RefundReason.NotOpen));
-        if (shares > c.maxFill) revert FillRejected(uint8(RefundReason.Cap));
+    /// @dev The checks of a fill that come before its print. Returns the product's band run.
+    function _checkFill(Round storage r, Order memory o) private view returns (uint8 lo, uint8 hi) {
+        RoundConfig storage c = r.cfg;
+        if (o.index >= PitMath.count(c.params.menu)) revert UnknownToken();
+        (lo, hi) = PitMath.run(c.params.menu, o.index);
+        if (r.st.status != Status.Open) revert FillRejected(uint8(RefundReason.NotOpen));
+        if (o.shares > c.maxFill) revert FillRejected(uint8(RefundReason.Cap));
         // A floor's outstanding supply is capped at a share of the round's capital.
-        if (isBuy && PitMath.overCap(lo, hi, r.supply[index] + shares, c.capital, c.params.floorCapBps)) {
+        if (o.isBuy && PitMath.overCap(lo, hi, r.supply[o.index] + o.shares, c.capital, c.params.floorCapBps))
+        {
             revert FillRejected(uint8(RefundReason.ProductCap));
         }
-        if (block.timestamp > uint256(t) + c.params.refundDelay) revert FillExpired();
+        if (block.timestamp > uint256(o.t) + c.params.refundDelay) revert FillExpired();
+    }
 
-        // The one print that counts for instant t; the oracle reverts on any other report.
-        (uint256 price, uint64 ts, bool trustless) =
-            oracle.verifyAt{value: address(this).balance}(c.ticker, t, report);
+    /// @dev The one print that counts for instant t (the oracle reverts on any other report), checked
+    ///      against the round's fill source and clock. Returns the price, its time and the share of the
+    ///      round's variance still ahead at that time.
+    function _print(RoundConfig storage c, uint64 t, bytes calldata report)
+        private
+        returns (uint256 price, uint64 ts, uint256 rho)
+    {
+        (price, ts) = _verify(c, t, report, msg.value);
+        // The round's clock at the print: how much of its variance is still ahead, and whether it trades.
+        bool tradable;
+        (rho, tradable) = book.clockAt(c.clock, ts);
+        if (!tradable) revert FillRejected(uint8(RefundReason.Window));
+    }
+
+    /// @dev The oracle's print for instant t, of the round's fill source; `value` pays the oracle's fee.
+    function _verify(RoundConfig storage c, uint64 t, bytes calldata report, uint256 value)
+        private
+        returns (uint256 price, uint64 ts)
+    {
+        bool trustless;
+        // The oracle calls outside contracts (Pyth, a Chainlink aggregator, a stock token) that can be
+        // upgraded. Their revert data must never pose as a final rejection (`FillRejected`), which the
+        // router turns into a refund: such data comes out as `OracleReverted`, which is not final.
+        try oracle.verifyAt{value: value}(c.ticker, t, report) returns (uint256 p, uint64 at, bool tl) {
+            (price, ts, trustless) = (p, at, tl);
+        } catch (bytes memory err) {
+            if (err.length >= 4 && bytes4(err) == FillRejected.selector) revert OracleReverted();
+            assembly ("memory-safe") {
+                revert(add(err, 0x20), mload(err))
+            }
+        }
         if (price == 0) revert BadPrice();
         // A round is priced by one source: a print of the other source is not the print for t.
         if ((c.fillSource == IPitBook.FillSource.TrustlessOnly) != trustless) revert WrongFillSource();
-        // The round's clock at the print: how much of its variance is still ahead, and whether it trades.
-        (uint256 rho, bool tradable) = book.clockAt(c.clock, ts);
-        if (!tradable) revert FillRejected(uint8(RefundReason.Window));
+    }
 
-        uint256 scale = 10 ** (18 - c.decimals);
-        ILadderMath.Fill memory f;
+    /// @dev Runs the engine for the fill, stores the new band state and depth scale, and takes the fill's
+    ///      risk from the budget of its print.
+    function _engine(Round storage r, Order memory o, uint8 lo, uint8 hi, uint256 rho)
+        private
+        returns (ILadderMath.PackedFill memory f)
+    {
+        // The remaining sd and the vega use the learned sigma; the bands stay on the frozen one.
+        ILadderMath.Ctx memory ctx;
+        (ctx.x, ctx.sd, ctx.gNew) = PitMath.context(sigmaEffOf(o.roundId), rho, r.cfg.s0, o.price, r.st.g);
+        ctx.gOld = r.st.g;
+        int256 delta = int256(o.shares * 10 ** (18 - r.cfg.decimals));
+        f = _solveFill(r, o.roundId, ctx, lo, hi, o.isBuy ? delta : -delta);
+        r.st.g = uint64(ctx.gNew); // at most the stored g (`PitMath.context`), so at most 1e18
+        // The risk budget of the print: every fill priced by the print of ts (every commit instant in
+        // (prevTs, ts]) shares capital * riskCapBps * gNew, gNew the depth scale at ts
+        // (`PitMath.riskBudget`). A buy risks what the house pays beyond the premium (shares - amount), a
+        // sell the chips it pays out. The book keeps the sum of the round's latest print (PitBook.takeRisk,
+        // PitBook.riskUsed).
+        if (!book.takeRisk(
+                o.roundId,
+                o.ts,
+                o.isBuy ? (uint256(delta) > f.amount ? uint256(delta) - f.amount : 0) : f.amount,
+                PitMath.riskBudget(r.cfg.capital, r.cfg.decimals, r.cfg.params.riskCapBps, ctx.gNew)
+            )) revert FillRejected(uint8(RefundReason.Cap));
+    }
+
+    /// @dev The engine's fill on the round's stored state, seeded with the last fill's root; stores the new
+    ///      state and its root in the house's slots (tagged with the round on its first fill).
+    function _solveFill(
+        Round storage r,
+        bytes32 roundId,
+        ILadderMath.Ctx memory ctx,
+        uint8 lo,
+        uint8 hi,
+        int256 delta
+    ) private returns (ILadderMath.PackedFill memory f) {
+        HouseBands storage b = _bands[r.cfg.house];
+        uint128 tag = _bandTag(roundId);
+        bool mine = b.tag == tag;
+        // before its first fill a round has the zero state, whose root is exactly 0 (the prior sums to 1e18)
+        f = math.fillPacked(_packedIn(r, b, mine), ctx, lo, hi, delta, mine ? b.lambda : int256(0));
+        (b.tag, b.lambda) = (tag, SafeCastLib.toInt128(f.lambda));
+        b.v = f.v;
+    }
+
+    /// @dev The tag of a round's pricing state in its house's slots (`RoundLogic.HouseBands`).
+    function _bandTag(bytes32 roundId) private pure returns (uint128) {
+        return uint128(uint256(roundId) >> 128);
+    }
+
+    /// @dev The engine's inputs for a fill of the round: its packed state (zero before its first fill) and
+    ///      what its depths come from.
+    function _packedIn(Round storage r, HouseBands storage b, bool mine)
+        private
+        view
+        returns (ILadderMath.PackedIn memory a)
+    {
+        RoundConfig storage c = r.cfg;
+        if (mine) a.v = b.v;
+        a.lnInv = _lnInv[c.house];
+        a.capital = c.capital * 10 ** (18 - c.decimals);
+        a.alpha = c.params.alpha;
+        a.sigma = c.sigma;
+    }
+
+    /// @dev Charges or pays the fill with its fees, moves the supply, cost basis and chips, and runs the
+    ///      round's pooled solvency and loss limit check.
+    function _account(Round storage r, Order memory o, ILadderMath.PackedFill memory f)
+        private
+        returns (uint256 chips, uint256 fee)
+    {
         {
-            // The remaining sd and the vega use the learned sigma; the bands stay on the frozen one.
-            (int256 x, uint256 sd, uint256 gNew) =
-                PitMath.context(sigmaEffOf(roundId), rho, c.s0, price, st.g);
-            int256 delta = int256(shares * scale);
-            f = math.fill(
-                PackedBands.load(r.v),
-                _depthsOf(c),
-                c.sigma,
-                ILadderMath.Ctx({x: x, sd: sd, gOld: st.g, gNew: gNew}),
-                lo,
-                hi,
-                isBuy ? delta : -delta
-            );
-            PackedBands.store(r.v, f.v);
-            st.g = gNew;
-            // The risk budget of the print: every fill priced by the print of ts (every commit instant in
-            // (prevTs, ts]) shares capital * riskCapBps * gNew, gNew the depth scale at ts
-            // (`PitMath.riskBudget`). A buy risks what the house pays beyond the premium (shares - amount), a
-            // sell the chips it pays out. The book keeps the sums (PitBook.takeRisk, PitBook.riskUsed), keyed
-            // by ts.
-            if (!book.takeRisk(
-                    roundId,
-                    ts,
-                    isBuy ? (uint256(delta) > f.amount ? uint256(delta) - f.amount : 0) : f.amount,
-                    PitMath.riskBudget(c.capital, c.decimals, c.params.riskCapBps, gNew)
-                )) revert FillRejected(uint8(RefundReason.Cap));
+            RoundConfig storage c = r.cfg;
+            uint256 scale = 10 ** (18 - c.decimals);
+            uint256 rate =
+                PitMath.feeRate(c.params.baseFee, c.params.closeFee, c.params.feeRamp, c.closeTs, o.ts);
+            uint256 vegaPerShare = uint256(c.params.vegaFee).mulWadUp(f.vega); // against the trader
+            if (o.isBuy) {
+                (chips, fee) =
+                    PitMath.buyCost(f.amount, scale, o.shares, rate, vegaPerShare, c.params.minPriceWad);
+            } else {
+                (chips, fee) = PitMath.sellProceeds(f.amount, scale, o.shares, rate, vegaPerShare);
+            }
         }
+        uint256 held = _move(r, o, chips);
+        uint256 protocolFees = r.st.protocolFees + fee * r.cfg.params.protocolFeeBps / BPS;
+        r.st.protocolFees = SafeCastLib.toUint128(protocolFees);
 
-        uint256 rate = PitMath.feeRate(c.params.baseFee, c.params.closeFee, c.params.feeRamp, c.closeTs, ts);
-        uint256 vegaPerShare = uint256(c.params.vegaFee).mulWad(f.vega);
-        uint256 held = st.held;
-        if (isBuy) {
-            (chips, fee) = PitMath.buyCost(f.amount, scale, shares, rate, vegaPerShare, c.params.minPriceWad);
-            r.supply[index] += shares;
-            r.premium[index] += chips;
+        // Pooled solvency: the worst band's payout plus the protocol's fees must be covered. And the
+        // round's loss limit: a buy must leave the house a set part of its capital in that worst band.
+        uint256 menu = r.cfg.params.menu;
+        RefundReason reason = PitMath.postFillCheck(
+            PitMath.supplyOf(r.supply, menu),
+            menu,
+            held,
+            protocolFees,
+            r.cfg.capital,
+            r.cfg.params.lossLimitBps,
+            o.isBuy
+        );
+        if (reason != RefundReason.None) revert FillRejected(uint8(reason));
+    }
+
+    /// @dev Moves a fill's tickets and chips in the round's books. Returns the chips the round holds after it.
+    ///      Supply and premium are 128-bit (`RoundLogic.Round`). The checked add on a buy and `toUint128`
+    ///      revert rather than wrap, and no real chip reaches them: every winning ticket must stay covered
+    ///      by `held` (`PitMath.postFillCheck`), the capital is at most 1e33 wei (the engine's depth check at
+    ///      the open), so supply and premium stay many orders of magnitude below 2^128 (3.4e38). Such a revert
+    ///      is not a refund reason: the commit waits for `refund`.
+    function _move(Round storage r, Order memory o, uint256 chips) private returns (uint256 held) {
+        address chip = r.cfg.chip;
+        uint8 index = o.index;
+        held = r.st.held;
+        if (o.isBuy) {
+            // shares fit 127 bits (`fill`); the sums revert past 128 bits
+            r.supply[index] += uint128(o.shares);
+            r.premium[index] = SafeCastLib.toUint128(r.premium[index] + chips);
             held += chips;
             chipOwed[chip] += chips;
         } else {
-            (chips, fee) = PitMath.sellProceeds(f.amount, scale, shares, rate, vegaPerShare);
             if (chips > held) revert FillRejected(uint8(RefundReason.Solvency));
             // The sold shares take their average cost with them (rounded up), and never less than the
             // chips they are paid: otherwise buying high and selling back would inflate the cost basis
             // that a void refunds, at the house's expense.
             uint256 premium = r.premium[index];
-            uint256 leaving = premium.fullMulDivUp(shares, r.supply[index]);
+            uint256 leaving = premium.fullMulDivUp(o.shares, r.supply[index]);
             if (leaving < chips) leaving = chips;
-            r.premium[index] = leaving < premium ? premium - leaving : 0;
-            r.supply[index] -= shares;
+            r.premium[index] = uint128(leaving < premium ? premium - leaving : 0);
+            r.supply[index] -= uint128(o.shares);
             held -= chips;
             chipOwed[chip] -= chips;
         }
-        st.held = held;
-        uint256 protocolFees = st.protocolFees + fee * c.params.protocolFeeBps / BPS;
-        st.protocolFees = protocolFees;
-
-        // Pooled solvency: the worst band's payout plus the protocol's fees must be covered. And the
-        // round's loss limit: a buy must leave the house a set part of its capital in that worst band.
-        RefundReason reason = PitMath.postFillCheck(
-            r.supply, c.params.menu, held, protocolFees, c.capital, c.params.lossLimitBps, isBuy
-        );
-        if (reason != RefundReason.None) revert FillRejected(uint8(reason));
-        emit Filled(roundId, user, index, isBuy, shares, chips, fee, price, ts);
-    }
-
-    /// @dev Voids an open round (see `voidRound`): the house first, then the holders pro rata to their cost.
-    function _void(Round storage r, bytes32 roundId) private {
-        RoundConfig storage c = r.cfg;
-        RoundState storage st = r.st;
-        uint256 held = st.held;
-        uint256 refundable = held > c.capital ? held - c.capital : 0;
-        uint256 refunds;
-        for (uint256 i; i < PitMath.MAX_PRODUCTS; ++i) {
-            refunds += r.premium[i];
-        }
-        if (refunds > refundable) {
-            uint256 total = refunds;
-            refunds = 0;
-            for (uint256 i; i < PitMath.MAX_PRODUCTS; ++i) {
-                uint256 scaled = r.premium[i].fullMulDiv(refundable, total);
-                r.premium[i] = scaled;
-                refunds += scaled;
-            }
-        }
-        uint256 back = held - refunds;
-        st.status = Status.Void;
-        st.held = refunds;
-        st.payoutOwed = refunds;
-        st.protocolFees = 0;
-        address chip = c.chip;
-        chipOwed[chip] -= back;
-
-        _pay(chip, address(vault), back);
-        vault.returnRoundCapital(c.house);
-        emit RoundVoided(roundId, refunds, back);
+        r.st.held = SafeCastLib.toUint128(held);
     }
 
     /// @dev The opening depths of a round: alpha * capital / lnInv per band (`ILadderMath.depths`).

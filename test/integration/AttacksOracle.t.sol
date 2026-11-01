@@ -188,6 +188,7 @@ contract AttacksOracleTest is AttackBase {
     // --------------------------------------------------------------------------------------------
 
     function test_attack_replay_keeperPrint() public {
+        _useKeeperClosedTicker();
         _open();
         // alice and eve commit in the same second: one print prices both, as designed
         uint256 aliceId = _commitBuy(alice, HIGHER, 5_000e18, STAKE);
@@ -215,15 +216,16 @@ contract AttacksOracleTest is AttackBase {
         _warp(t2);
         assertEq(_fillReverts(lateId, print), PitOracle.NotThePrintForT.selector);
         // re-stamping it for t2 breaks the signatures: the recovered signers are strangers
-        PitOracle.Print memory restamped = PitOracle.Print({ticker: NVDA, price: S0, ts: t2, prevTs: t2 - 1});
+        PitOracle.Print memory restamped =
+            PitOracle.Print({ticker: ticker, price: S0, ts: t2, prevTs: t2 - 1});
         (PitOracle.Print memory original, bytes[] memory sigs) = _decodePrint(print);
         assertEq(original.price, S0);
         assertEq(_fillReverts(lateId, _report(restamped, sigs)), PitOracle.NotASigner.selector);
-        assertTrue(eve.fill(lateId, _keeperPrint(NVDA, S0 * 1015 / 1000, t2)));
+        assertTrue(eve.fill(lateId, _keeperPrint(ticker, S0 * 1015 / 1000, t2)));
 
         // Monday's close print cannot be replayed as Tuesday's close, nor fill anything today
         uint64 mondayClose = NYTime.closeTs(day0);
-        bytes memory closePrint = _keeperPrint(NVDA, S0, mondayClose);
+        bytes memory closePrint = _keeperPrint(ticker, S0, mondayClose);
         uint256 id3 = eve.commit(roundId, LOWER, true, 1_000e18, 10_000e18);
         _warp(router.getCommit(id3).fillTs);
         assertEq(_fillReverts(id3, closePrint), PitOracle.NotThePrintForT.selector);
@@ -233,9 +235,9 @@ contract AttacksOracleTest is AttackBase {
                 PitOracle.NotThePrintForT.selector, NYTime.closeTs(day), mondayClose - 1, mondayClose
             )
         );
-        book.recordClose(NVDA, day, closePrint);
+        book.recordClose(ticker, day, closePrint);
         vm.expectRevert(IPitBook.ReplacementRefused.selector);
-        book.recordClose(NVDA, day0, closePrint);
+        book.recordClose(ticker, day0, closePrint);
     }
 
     function _decodePrint(bytes memory report)
@@ -275,28 +277,30 @@ contract AttacksOracleTest is AttackBase {
     // --------------------------------------------------------------------------------------------
 
     function test_attack_keeperPrintOutsideTheChainlinkBound() public {
+        _useKeeperClosedTicker();
         _open();
         uint256 id = eve.commit(roundId, HIGHER, true, 5_000e18, EVE_CHIPS);
         uint64 t = router.getCommit(id).fillTs;
         _warp(t);
         // the mirror's round in force is Monday's close, 180.00. Two colluding signers sign 1% below it,
         // which would make HIGHER cheap for eve.
-        (, int256 answer,,,) = feedOf[NVDA].latestRoundData();
+        (, int256 answer,,,) = feedOf[ticker].latestRoundData();
         assertEq(uint256(answer), S0 / 1e10);
-        bytes memory low = _signedPrint(NVDA, S0 * 99 / 100, t, t - 1);
+        bytes memory low = _signedPrint(ticker, S0 * 99 / 100, t, t - 1);
         assertEq(_fillReverts(id, low), PitOracle.OutOfBound.selector);
         // 61 bps is out, on either side
         assertEq(
-            _fillReverts(id, _signedPrint(NVDA, S0 * 9939 / 10_000, t, t - 1)), PitOracle.OutOfBound.selector
+            _fillReverts(id, _signedPrint(ticker, S0 * 9939 / 10_000, t, t - 1)),
+            PitOracle.OutOfBound.selector
         );
         assertEq(
-            _fillReverts(id, _signedPrint(NVDA, S0 * 10_061 / 10_000, t, t - 1)),
+            _fillReverts(id, _signedPrint(ticker, S0 * 10_061 / 10_000, t, t - 1)),
             PitOracle.OutOfBound.selector
         );
         // what two colluding signers can do is bounded: 60 bps from the feed, here 1.2 bands of the ladder
         (uint256 honest,,,,,) = lens.quote(roundId, HIGHER, true, 5_000e18, S0, t);
         (uint256 skewed,,,,,) = lens.quote(roundId, HIGHER, true, 5_000e18, S0 * 9940 / 10_000, t);
-        assertTrue(eve.fill(id, _signedPrint(NVDA, S0 * 9940 / 10_000, t, t - 1)));
+        assertTrue(eve.fill(id, _signedPrint(ticker, S0 * 9940 / 10_000, t, t - 1)));
         assertEq(EVE_CHIPS - chip.balanceOf(address(eve)), skewed);
         emit log_named_decimal_uint("cost at the honest print", honest, 18);
         emit log_named_decimal_uint("cost at the print 60 bps low", skewed, 18);
@@ -304,9 +308,9 @@ contract AttacksOracleTest is AttackBase {
         // the same bound holds for the close: an out-of-bound close print cannot be recorded
         uint64 closeAt = NYTime.closeTs(day);
         _warp(closeAt + 5);
-        bytes memory badClose = _signedPrint(NVDA, S0 * 102 / 100, closeAt, closeAt - 1);
+        bytes memory badClose = _signedPrint(ticker, S0 * 102 / 100, closeAt, closeAt - 1);
         vm.expectRevert(abi.encodeWithSelector(PitOracle.OutOfBound.selector, S0 * 102 / 100, S0));
-        book.recordClose(NVDA, day, badClose);
+        book.recordClose(ticker, day, badClose);
     }
 
     /// @dev The feed lags the market: a correct print can lead the round that confirms it. A round that
@@ -369,5 +373,24 @@ contract AttacksOracleTest is AttackBase {
             _fillReverts(id2, _keeperPrint(TSLA, TSLA_S0 * 9945 / 10_000, t2)),
             IFallpitHook.WrongFillSource.selector
         );
+    }
+
+    /// @dev An outside contract the oracle calls (here the Chainlink aggregator, which can be upgraded)
+    ///      reverts with bytes shaped like a final rejection. The fill is not refunded: the hook re-raises
+    ///      it as OracleReverted, which is not final, and the commit stays pending.
+    function test_attack_upstreamRevertCannotPoseAsAFinalRejection() public {
+        _open();
+        uint256 id = eve.commit(roundId, HIGHER, true, 5_000e18, EVE_CHIPS);
+        uint64 t = router.getCommit(id).fillTs;
+        _warp(t);
+        bytes memory report = _keeperPrint(NVDA, S0, t);
+        vm.mockCallRevert(
+            address(feedOf[NVDA]),
+            abi.encodeWithSelector(feedOf[NVDA].latestRoundData.selector),
+            abi.encodeWithSelector(IFallpitHook.FillRejected.selector, uint8(1))
+        );
+        assertEq(_fillReverts(id, report), IFallpitHook.OracleReverted.selector);
+        vm.clearMockedCalls();
+        assertTrue(eve.fill(id, report), "the same print fills once the aggregator behaves");
     }
 }

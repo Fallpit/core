@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {Accounting} from "../Accounting.sol";
 
 import {Test} from "forge-std/Test.sol";
+import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 
 import {HookFixture} from "./HookFixture.sol";
 import {MockChip} from "./mocks/MockChips.sol";
@@ -22,11 +23,11 @@ import {Menus} from "../Menus.sol";
 ///         ghost totals of what traders paid in and took out. Commits carry the fill fee; they are filled
 ///         in turn by an account that takes the fee (`keeper`), by this contract and by `grump`, neither
 ///         of which can receive native coin, so their fees wait in the router until `claim`. The round can
-///         have any menu: the handler trades whatever products it has.
+///         have any menu: the handler trades whatever products it has, the live strikes it opens included.
 contract PitHandler is Test {
     bytes32 internal constant NVDA = bytes32("NVDA");
     uint8 internal constant KEEPER = 2;
-    uint256 internal constant FILL_FEE = 0.0001 ether;
+    uint256 internal constant FILL_FEE = 0.000025 ether;
     uint256 public constant ACTOR_ETH = 10 ether;
 
     FallpitRouter public immutable router;
@@ -36,8 +37,9 @@ contract PitHandler is Test {
     bytes32 public immutable roundId;
     uint64 public immutable cutoff;
     uint256 public immutable s0;
-    /// @dev Number of products of the round's menu, and the round's minimum price per token.
-    uint8 public immutable products;
+    /// @dev Number of products of the round (its menu and the strikes opened so far), and the round's
+    ///      minimum price per token.
+    uint8 public products;
     uint256 public immutable minPrice;
 
     address[4] public actors;
@@ -59,8 +61,12 @@ contract PitHandler is Test {
     uint256 public sells;
     uint256 public feesEarned;
     uint256 public feesClaimed;
+    uint256 public strikes;
     uint256[] public abandoned;
     mapping(uint64 ts => bytes) internal _reports;
+    /// @dev every posted print, in order, and its price: a late strike picks one of them
+    uint64[] internal _posted;
+    mapping(uint64 ts => uint256) internal _postedPrice;
 
     constructor(
         FallpitRouter router_,
@@ -84,7 +90,7 @@ contract PitHandler is Test {
         cutoff = c.cutoff;
         products = uint8(PitMath.count(c.params.menu));
         minPrice = c.params.minPriceWad;
-        Ticket[12] memory tokens = ticketsOf(hook_, roundId_);
+        Ticket[15] memory tokens = ticketsOf(hook_, roundId_);
         for (uint256 i; i < 4; ++i) {
             address actor = address(uint160(0xA11CE000 + i));
             actors[i] = actor;
@@ -156,21 +162,25 @@ contract PitHandler is Test {
         (shares, limitSeed) = _mix(shares, limitSeed);
         address actor = actors[actorSeed % 4];
         // the first token at or after `index` that the actor holds
-        Ticket[12] memory tokens = ticketsOf(hook, roundId);
         Ticket memory token;
         uint256 held;
-        for (uint8 k; k < products && held == 0; ++k) {
-            index = (index + (k == 0 ? 0 : 1)) % products;
-            token = tokens[index];
-            held = token.balanceOf(actor);
+        {
+            Ticket[15] memory tokens = ticketsOf(hook, roundId);
+            for (uint8 k; k < products && held == 0; ++k) {
+                index = (index + (k == 0 ? 0 : 1)) % products;
+                token = tokens[index];
+                held = token.balanceOf(actor);
+            }
         }
         if (held < 1e18) return;
         shares = bound(shares, 1e18, held);
-        uint256 limit = limitSeed % 8 == 0 ? bound(limitSeed, 0, shares) : 0;
         uint256 balance = chip.balanceOf(actor);
-
-        vm.prank(actor);
-        uint256 id = router.commit{value: FILL_FEE}(roundId, index, false, shares, limit);
+        uint256 id;
+        {
+            uint256 limit = limitSeed % 8 == 0 ? bound(limitSeed, 0, shares) : 0;
+            vm.prank(actor);
+            id = router.commit{value: FILL_FEE}(roundId, index, false, shares, limit);
+        }
         bool filled = _fill(id);
         uint256 got = chip.balanceOf(actor) - balance;
         if (filled) {
@@ -183,6 +193,79 @@ contract PitHandler is Test {
             assertEq(token.balanceOf(actor), held, "a refunded sell returns the tokens");
             ++refunds;
         }
+    }
+
+    /// @dev Opens the live strike at the oracle's price now, when the rules allow (anyone may). Only the
+    ///      strike rules may refuse it: too early, too close to the pair or an open strike, no room.
+    function strike(uint256 dt, uint256 drift) external {
+        tick(dt, drift);
+        if (clock + 4 > cutoff || _reports[clock].length != 0) return;
+        IFallpitHook.RoundConfig memory c = hook.getConfig(roundId);
+        uint8 m = PitMath.nearestEdge(
+            c.sigma, FixedPointMathLib.lnWad(int256(FixedPointMathLib.divWad(price, c.s0)))
+        );
+        bytes memory report = _post(clock);
+        try hook.openStrike(roundId, m, clock, report) {
+            ++strikes;
+            products = uint8(PitMath.count(hook.getConfig(roundId).params.menu));
+        } catch (bytes memory err) {
+            bytes4 why = bytes4(err);
+            assertTrue(
+                why == IFallpitHook.StrikeTooEarly.selector || why == IFallpitHook.StrikeTooClose.selector
+                    || why == IFallpitHook.StrikeNotPinned.selector
+                    || why == IFallpitHook.StrikeNoRoom.selector,
+                "only the strike rules refuse a strike"
+            );
+        }
+    }
+
+    /// @dev Opens a strike with the print of an earlier instant (any posted print of the last two minutes, at
+    ///      the price it had), sometimes on a wrong edge. Only the strike rules, the edge rule and the
+    ///      instant's age may refuse it, and one that opens used an instant at most STRIKE_MAX_LAG old.
+    function strikeLate(uint256 dt, uint256 drift, uint256 pick, uint256 wrong) external {
+        tick(dt, drift);
+        uint256 n = _posted.length;
+        if (n == 0 || clock + 4 > cutoff) return;
+        uint64 t = _posted[n - 1 - bound(pick, 0, n - 1 < 8 ? n - 1 : 8)];
+        if (clock - t > 120) return;
+        IFallpitHook.RoundConfig memory c = hook.getConfig(roundId);
+        uint8 m = PitMath.nearestEdge(
+            c.sigma, FixedPointMathLib.lnWad(int256(FixedPointMathLib.divWad(_postedPrice[t], c.s0)))
+        );
+        wrong = wrong % 4;
+        if (wrong == 1 && m < PitMath.LAST_EDGE) ++m;
+        else if (wrong == 2 && m > 0) --m;
+        try hook.openStrike(roundId, m, t, _reports[t]) {
+            ++strikes;
+            products = uint8(PitMath.count(hook.getConfig(roundId).params.menu));
+            assertLe(clock - t, PitMath.STRIKE_MAX_LAG, "a strike opens only on a recent instant");
+            assertLe(clock - t, c.params.refundDelay);
+        } catch (bytes memory err) {
+            bytes4 why = bytes4(err);
+            assertTrue(
+                why == IFallpitHook.StrikeTooEarly.selector || why == IFallpitHook.StrikeTooClose.selector
+                    || why == IFallpitHook.StrikeNotPinned.selector
+                    || why == IFallpitHook.StrikeNoRoom.selector || why == IFallpitHook.StrikeEdge.selector
+                    || why == IFallpitHook.FillExpired.selector || why == IFallpitHook.StrikeWindow.selector,
+                "only the strike rules, the edge and the instant's age refuse a late strike"
+            );
+            if (why == IFallpitHook.FillExpired.selector) {
+                assertGt(
+                    clock - t,
+                    PitMath.STRIKE_MAX_LAG < c.params.refundDelay
+                        ? PitMath.STRIKE_MAX_LAG
+                        : c.params.refundDelay
+                );
+            }
+        }
+    }
+
+    /// @dev Posts the oracle's print of `t` at the current price and keeps it.
+    function _post(uint64 t) internal returns (bytes memory report) {
+        report = oracle.post(NVDA, KEEPER, price, t);
+        _reports[t] = report;
+        _posted.push(t);
+        _postedPrice[t] = price;
     }
 
     /// @dev A commit nobody fills: its escrow sits in the router until `refundStale`.
@@ -246,10 +329,7 @@ contract PitHandler is Test {
             vm.warp(t);
         }
         bytes memory report = _reports[t];
-        if (report.length == 0) {
-            report = oracle.post(NVDA, KEEPER, price, t);
-            _reports[t] = report;
-        }
+        if (report.length == 0) report = _post(t);
         // whoever fills is paid the commit's fee, whether the fill trades or refunds
         uint256 turn = id % 3;
         if (turn == 0) {
@@ -295,13 +375,15 @@ contract FallpitInvariantTest is HookFixture {
         handler = new PitHandler(router, hook, oracle, chip, roundId, clock, S0);
         totalChips = HOUSE_CAPITAL + 4 * 500_000e18;
 
-        bytes4[] memory selectors = new bytes4[](6);
+        bytes4[] memory selectors = new bytes4[](8);
         selectors[0] = PitHandler.buy.selector;
         selectors[1] = PitHandler.sell.selector;
         selectors[2] = PitHandler.buy.selector;
         selectors[3] = PitHandler.abandon.selector;
         selectors[4] = PitHandler.refundStale.selector;
         selectors[5] = PitHandler.claim.selector;
+        selectors[6] = PitHandler.strike.selector;
+        selectors[7] = PitHandler.strikeLate.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         targetContract(address(handler));
     }
@@ -312,22 +394,25 @@ contract FallpitInvariantTest is HookFixture {
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_roundStaysSolventAndConserved() public view {
         IFallpitHook.RoundState memory st = _state();
-        (uint256[12] memory supply, uint256[12] memory premium) = hook.getSupplies(roundId);
-        Ticket[12] memory tokens = ticketsOf(hook, roundId);
+        (uint256[15] memory supply, uint256[15] memory premium) = hook.getSupplies(roundId);
+        Ticket[15] memory tokens = ticketsOf(hook, roundId);
 
+        // the round's menu: the one it opened with, then the strikes opened since, in pairs on one edge
+        uint256 live = hook.getConfig(roundId).params.menu;
+        _assertStrikes(live);
         // pooled solvency: the worst band's payout plus the protocol's fees is covered. The worst band is
         // recomputed here band by band, without the hook's difference array.
-        uint256 n = PitMath.count(menu);
+        uint256 n = PitMath.count(live);
         uint256 worst;
         for (uint256 j; j < 40; ++j) {
             uint256 payout;
             for (uint256 i; i < n; ++i) {
-                (uint8 lo, uint8 hi) = PitMath.run(menu, i);
+                (uint8 lo, uint8 hi) = PitMath.run(live, i);
                 if (lo <= j && j <= hi) payout += supply[i];
             }
             if (payout > worst) worst = payout;
         }
-        assertEq(PitMath.maxPayout(supply, menu), worst, "the worst band, counted directly");
+        assertEq(PitMath.maxPayout(supply, live), worst, "the worst band, counted directly");
         assertLe(worst + st.protocolFees, st.held, "solvency");
 
         // the token is the claim: totalSupply equals the outstanding supply the hook uses
@@ -340,7 +425,7 @@ contract FallpitInvariantTest is HookFixture {
             {
                 // a floor never has more than its product cap outstanding (the whole capital at the
                 // default of 10000: the cap is off by default)
-                (uint8 lo, uint8 hi) = PitMath.run(menu, i);
+                (uint8 lo, uint8 hi) = PitMath.run(live, i);
                 uint256 capBps = hook.getConfig(roundId).params.floorCapBps;
                 if (uint256(hi) - lo + 1 < 20) {
                     assertLe(supply[i] * 10_000, HOUSE_CAPITAL * capBps, "product cap");
@@ -397,9 +482,37 @@ contract FallpitInvariantTest is HookFixture {
         assertEq(eth, 4 * handler.ACTOR_ETH(), "native coin is conserved");
     }
 
+    /// @dev The round's live menu is the menu it opened with, then pairs `[0, m]`, `[m + 1, 39]` with each m
+    ///      at least two edges from 19 and from the others.
+    function _assertStrikes(uint256 live) internal view {
+        uint256 base = PitMath.strikeFrom(live);
+        assertEq(base, PitMath.count(menu), "the strikes come after the menu");
+        for (uint256 i; i < base; ++i) {
+            (uint8 a, uint8 b) = PitMath.run(live, i);
+            (uint8 c, uint8 d) = PitMath.run(menu, i);
+            assertEq(a, c, "the menu is kept");
+            assertEq(b, d, "the menu is kept");
+        }
+        uint256 n = PitMath.count(live);
+        assertLe(n, 15);
+        assertEq((n - base) % 2, 0, "strikes come in pairs");
+        for (uint256 i = base; i < n; i += 2) {
+            (uint8 lo, uint8 m) = PitMath.run(live, i);
+            (uint8 lo2, uint8 hi2) = PitMath.run(live, i + 1);
+            assertEq(lo, 0);
+            assertEq(lo2, m + 1);
+            assertEq(hi2, 39);
+            assertGe(m > 19 ? m - 19 : 19 - m, 2, "two edges from the pair");
+            for (uint256 k = base; k < i; k += 2) {
+                (, uint8 other) = PitMath.run(live, k);
+                assertGe(m > other ? m - other : other - m, 2, "two edges from another strike");
+            }
+        }
+    }
+
     /// @dev After the random session: close at wherever the oracle ended, settle, finalize, refund what
     ///      is pending, redeem everything, collect fees. The books must close to the unit.
-    function afterInvariant() public {
+    function afterInvariant() public virtual {
         uint256 closePrice = handler.price();
         clock = handler.clock();
         emit log_named_uint("fills", handler.fills());
@@ -408,24 +521,26 @@ contract FallpitInvariantTest is HookFixture {
         emit log_named_uint("abandoned", handler.abandonedCount());
         emit log_named_decimal_uint("paidIn", handler.paidIn(), 18);
         emit log_named_decimal_uint("paidOut", handler.paidOut(), 18);
-        (uint256[12] memory supply,) = hook.getSupplies(roundId);
+        emit log_named_uint("strikes", handler.strikes());
+        (uint256[15] memory supply,) = hook.getSupplies(roundId);
         IFallpitHook.RoundState memory open = _state();
+        uint256 live = hook.getConfig(roundId).params.menu;
 
         _closeAndFinalize(closePrice);
         IFallpitHook.RoundState memory fin = _state();
         assertEq(fin.payoutOwed, PitMath.payoutOf(supply, fin.winners));
-        assertEq(fin.winners, PitMath.winners(menu, fin.closeBand), "the products whose run holds the close");
-        emit log_named_uint("products", PitMath.count(menu));
+        assertEq(fin.winners, PitMath.winners(live, fin.closeBand), "the products whose run holds the close");
+        emit log_named_uint("products", PitMath.count(live));
         emit log_named_uint("close band", fin.closeBand);
         emit log_named_uint("winners (bit mask)", fin.winners);
         uint256 vaultBack = chip.balanceOf(address(vault));
         assertEq(vaultBack, open.held - fin.payoutOwed - open.protocolFees);
 
-        Ticket[12] memory tokens = ticketsOf(hook, roundId);
+        Ticket[15] memory tokens = ticketsOf(hook, roundId);
         uint256 redeemed;
         for (uint256 a; a < 4; ++a) {
             address actor = handler.actors(a);
-            for (uint256 i; i < PitMath.count(menu); ++i) {
+            for (uint256 i; i < PitMath.count(live); ++i) {
                 uint256 balance = tokens[i].balanceOf(actor);
                 if (balance == 0 || fin.winners >> i & 1 == 0) continue;
                 vm.prank(actor);
@@ -463,6 +578,63 @@ contract FallpitInvariantTest is HookFixture {
         assertEq(claims, 0);
         assertEq(owed, 0);
         uint256 sum = vaultBack + fees;
+        for (uint256 i; i < 4; ++i) {
+            sum += chip.balanceOf(handler.actors(i));
+        }
+        assertEq(sum, totalChips);
+    }
+}
+
+/// @notice The same campaign, then no close is recorded and the round is voided a day after its close, with
+///         whatever strikes opened: the house first, then every holder of every product (strikes included)
+///         pro rata to its cost, never more than its cost basis, and every chip accounted for.
+/// forge-config: default.invariant.runs = 24
+contract FallpitInvariantVoidTest is FallpitInvariantTest {
+    function afterInvariant() public override {
+        emit log_named_uint("strikes", handler.strikes());
+        uint256 live = hook.getConfig(roundId).params.menu;
+        uint256 n = PitMath.count(live);
+        (uint256[15] memory supply, uint256[15] memory premium) = hook.getSupplies(roundId);
+        _warp(NYTime.closeTs(day) + 24 hours + 1);
+        hook.voidRound(house, day);
+        IFallpitHook.RoundState memory v = _state();
+        assertEq(uint8(v.status), uint8(IFallpitHook.Status.Void));
+        (, uint256[15] memory refund) = hook.getSupplies(roundId);
+        for (uint256 i; i < n; ++i) {
+            assertLe(refund[i], premium[i], "a product's refund is at most its cost basis");
+        }
+        uint256 vaultBack = chip.balanceOf(address(vault));
+
+        Ticket[15] memory tokens = ticketsOf(hook, roundId);
+        uint256 redeemed;
+        uint256[15] memory paidOf;
+        for (uint256 a; a < 4; ++a) {
+            address actor = handler.actors(a);
+            for (uint256 i; i < n; ++i) {
+                uint256 balance = tokens[i].balanceOf(actor);
+                if (balance == 0) continue;
+                vm.prank(actor);
+                uint256 paid = router.redeem(tokens[i].id, balance);
+                paidOf[i] += paid;
+                redeemed += paid;
+            }
+        }
+        for (uint256 i; i < n; ++i) {
+            assertLe(paidOf[i], refund[i], "a product's holders share at most its refund");
+            if (supply[i] != 0) assertGe(paidOf[i] + 4, refund[i], "and all of it but rounding dust");
+        }
+        assertLe(redeemed, v.payoutOwed, "never more than the refunds");
+        assertLe(v.payoutOwed - redeemed, 4 * n, "the holders get all of it but rounding dust");
+        for (uint256 i = handler.abandonedCount(); i > 0; --i) {
+            router.refund(handler.abandoned(i - 1));
+        }
+        uint256 left = chip.balanceOf(address(hook));
+        assertEq(
+            HOUSE_CAPITAL + handler.paidIn(),
+            handler.paidOut() + redeemed + vaultBack + left,
+            "cash conservation"
+        );
+        uint256 sum = vaultBack + left + chip.balanceOf(address(router));
         for (uint256 i; i < 4; ++i) {
             sum += chip.balanceOf(handler.actors(i));
         }

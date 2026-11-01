@@ -94,43 +94,41 @@ contract PackedStateTest is IntegrationFixture {
         ILadderMath.Fill f;
         uint256 gNew;
         uint64 ts;
+        int256 lambda;
     }
 
-    /// @dev What `math.fill` returns for commit `id` at `price`, computed here with the hook's inputs
+    /// @dev What `math.fillFrom` returns for commit `id` at `price`, computed here with the hook's inputs
     ///      (warps to the fill instant).
     function _expect(uint256 id, uint256 price) internal returns (Expect memory e) {
         IFallpitRouter.Commit memory c = router.getCommit(id);
         e.ts = c.fillTs;
         if (clock < e.ts) _warp(e.ts);
         IFallpitHook.RoundConfig memory cfg = hook.getConfig(roundId);
-        IFallpitHook.RoundState memory st = hook.getState(roundId);
-        (int256[40] memory v0, uint256[40] memory b0) = hook.getCurve(roundId);
-        (uint256 rho,) = book.clockAt(cfg.clock, e.ts);
-        (int256 x, uint256 sd, uint256 gNew) =
-            PitMath.context(hook.sigmaEffOf(roundId), rho, cfg.s0, price, st.g);
+        ILadderMath.Ctx memory ctx;
+        {
+            IFallpitHook.RoundState memory st = hook.getState(roundId);
+            (uint256 rho,) = book.clockAt(cfg.clock, e.ts);
+            (ctx.x, ctx.sd, ctx.gNew) = PitMath.context(hook.sigmaEffOf(roundId), rho, cfg.s0, price, st.g);
+            ctx.gOld = st.g;
+        }
         (uint8 lo, uint8 hi) = PitMath.run(cfg.params.menu, uint8(c.id & 0xff));
         int256 delta = int256(uint256(c.shares) * 10 ** (18 - cfg.decimals));
-        e.f = math.fill(
-            v0,
-            b0,
-            cfg.sigma,
-            ILadderMath.Ctx({x: x, sd: sd, gOld: st.g, gNew: gNew}),
-            lo,
-            hi,
-            c.isBuy ? delta : -delta
-        );
-        e.gNew = gNew;
+        (int256[40] memory v0, uint256[40] memory b0) = hook.getCurve(roundId);
+        (e.f, e.lambda) =
+            math.fillFrom(v0, b0, cfg.sigma, ctx, lo, hi, c.isBuy ? delta : -delta, hook.seedOf(roundId));
+        e.gNew = ctx.gNew;
     }
 
     function _assertCurve(int256[40] memory want) internal view {
         (int256[40] memory v,) = hook.getCurve(roundId);
         for (uint256 j; j < 40; ++j) {
-            assertEq(v[j], want[j], "getCurve is the state math.fill returned");
+            assertEq(v[j], want[j], "getCurve is the state math.fillFrom returned");
         }
     }
 
-    /// @notice After each fill `getCurve` returns exactly the state `math.fill` handed back, buys and sells,
-    ///         and the book's risk sum grew by the fill's risk under the budget the hook passed.
+    /// @notice After each fill `getCurve` returns exactly the state `math.fillFrom` handed back (seeded with
+    ///         `seedOf`), buys and sells, `seedOf` is the root it returned, and the book's risk sum grew by
+    ///         the fill's risk under the budget the hook passed.
     function test_getCurve_afterFills_isTheMathState() public {
         _open();
         (int256[40] memory v,) = hook.getCurve(roundId);
@@ -158,6 +156,7 @@ contract PackedStateTest is IntegrationFixture {
             vm.prank(keeper);
             assertTrue(router.fill(ids[i], report), "filled");
             _assertCurve(e.f.v);
+            assertEq(hook.seedOf(roundId), e.lambda, "the next fill starts at the root this one returned");
             uint256 delta = uint256(c.shares);
             uint256 risk = c.isBuy ? (delta > e.f.amount ? delta - e.f.amount : 0) : e.f.amount;
             assertEq(book.riskUsed(roundId, e.ts), usedBefore + risk, "risk taken");
@@ -170,6 +169,29 @@ contract PackedStateTest is IntegrationFixture {
         _open();
         vm.expectRevert(IPitBook.OnlyHook.selector);
         book.takeRisk(roundId, clock, 1, type(uint256).max);
+    }
+
+    /// @notice One sum per round: a later print starts its own, a fill on an earlier print than the latest is
+    ///         charged to the latest print's sum (it resets nothing and is not refused for its order), and
+    ///         `riskUsed` shows the latest print's sum (0 for any other print).
+    function test_takeRisk_followsTheLatestPrint() public {
+        _open();
+        vm.startPrank(address(hook));
+        assertTrue(book.takeRisk(roundId, clock + 10, 50, 100));
+        assertFalse(book.takeRisk(roundId, clock + 10, 51, 100), "the print's budget binds its fills");
+        assertTrue(
+            book.takeRisk(roundId, clock + 9, 20, 100), "an earlier print is not refused for its order"
+        );
+        assertEq(book.riskUsed(roundId, clock + 10), 70, "it is charged to the latest print's sum");
+        assertEq(book.riskUsed(roundId, clock + 9), 0, "and starts no sum of its own");
+        assertFalse(book.takeRisk(roundId, clock + 9, 31, 100), "nor a fresh budget");
+        assertTrue(book.takeRisk(roundId, clock + 10, 30, 100));
+        assertFalse(book.takeRisk(roundId, clock + 9, 1, 100), "the latest print's budget binds it too");
+        assertEq(book.riskUsed(roundId, clock + 10), 100, "and resets nothing");
+        assertTrue(book.takeRisk(roundId, clock + 11, 60, 100), "a later print has its own budget");
+        vm.stopPrank();
+        assertEq(book.riskUsed(roundId, clock + 11), 60);
+        assertEq(book.riskUsed(roundId, clock + 10), 0, "the sum of the latest print only");
     }
 
     /// @notice The budget formula of `riskBudgetOf` is `capital * 10^(18 - decimals) * riskCapBps / 1e18
@@ -201,6 +223,28 @@ contract PackedStateTest is IntegrationFixture {
         c = router.getCommit(999);
         assertEq(c.escrow, 0, "no commit");
         assertEq(c.user, address(0));
+    }
+
+    /// @notice The packed commit record: `getCommit` gives back the earlier commit that holds a commit (stored
+    ///         as a distance in ids), its fill instant and its limit; a limit past 128 bits is refused.
+    function test_getCommit_packedFields() public {
+        _open();
+        uint256 a = _commitBuy(alice, HIGHER, 1_000e18, 7_000e18);
+        uint256 b = _commitBuy(bob, LOWER, 500e18, 2_000e18);
+        IFallpitRouter.Commit memory ca = router.getCommit(a);
+        IFallpitRouter.Commit memory cb = router.getCommit(b);
+        assertEq(ca.prev, 0, "the round's first commit has no earlier one");
+        assertEq(cb.prev, a, "the next one in the same window is held by it");
+        assertEq(cb.fillTs, ca.fillTs);
+        assertEq(cb.limit, 2_000e18);
+        assertEq(cb.shares, 500e18);
+
+        // a sell escrows tickets, so its limit (the least it takes) reaches the record unchecked by a transfer
+        assertTrue(_fill(a, S0));
+        uint256 fee = _fillFee();
+        vm.prank(alice);
+        vm.expectRevert(IFallpitRouter.LimitTooLarge.selector);
+        router.commit{value: fee}(roundId, HIGHER, false, 1e18, uint256(type(uint128).max) + 1);
     }
 
     /// @notice The escrow totals: the sum of the pending commits while they wait, 0 once all are released

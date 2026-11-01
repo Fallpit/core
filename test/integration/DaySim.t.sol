@@ -113,7 +113,80 @@ contract DaySimTest is IntegrationFixture {
         return diff <= want / REL_TOL + ABS_TOL;
     }
 
+    /// @dev The running sums of `test_daySim_everyFillAndTheHouseResult_matchTheReference`.
+    struct Tally {
+        uint256 worstRel;
+        uint256 worstRho;
+        uint256 paid;
+        uint256 received;
+        int256 drift; // sum of (contract - reference), in the house's favour when positive
+        uint256 fills;
+        uint256 minPriced;
+        uint256 lowestCushion;
+    }
+
+    /// @dev Trade `i` of the day, checked against the reference, added to `t`.
+    function _trade(
+        Day memory d,
+        IFallpitHook.RoundConfig memory c,
+        uint64 prevClose,
+        uint256 i,
+        Tally memory t
+    ) internal {
+        // the commit is made two seconds before the print that prices it
+        _warp(prevClose + uint64(d.offset[i]) - 2);
+        uint8 product = uint8(d.product[i]);
+        uint256 fee;
+        uint256 pBefore;
+        RefundReason verdict;
+        (, fee, pBefore,,, verdict) =
+            lens.quote(roundId, product, d.isBuy[i], d.shares[i], d.price[i], clock + 2);
+        assertEq(uint8(verdict), uint8(RefundReason.None), "nothing is refused on this day");
+        uint256 chips = d.isBuy[i]
+            ? _buy(alice, product, d.shares[i], d.price[i])
+            : _sell(alice, product, d.shares[i], d.price[i]);
+        assertEq(clock, prevClose + d.offset[i], "filled at the print the reference priced");
+        ++t.fills;
+        if (d.minPriced[i]) {
+            // charged the minimum price: exactly two hundredths of a chip per token before the fee
+            assertEq(chips - fee, d.shares[i] * 2 / 100, "the minimum price, to the unit");
+            assertLt(pBefore, 0.02e18, "the engine asked less");
+            ++t.minPriced;
+        } else if (d.isBuy[i]) {
+            assertGt(chips - fee, d.shares[i] * 2 / 100, "above the minimum price");
+        }
+        {
+            // the clock at that print: the book's (which the hook used) against the reference's
+            (uint256 rho, bool tradable) = book.clockAt(c.clock, clock);
+            assertTrue(tradable);
+            uint256 rhoDiff = rho > d.rho[i] ? rho - d.rho[i] : d.rho[i] - rho;
+            if (rhoDiff > t.worstRho) t.worstRho = rhoDiff;
+            assertLe(rhoDiff, 1e6, "rho differs from the reference by more than rounding");
+        }
+        assertTrue(_within(chips, d.chips[i]), "a fill differs from the reference by more than rounding");
+        assertTrue(_within(fee, d.fee[i]), "a fee differs from the reference by more than rounding");
+        {
+            // the house's worst-band cushion after the fill, against the reference's; it never
+            // comes near the loss limit's floor on this day
+            (uint256 cushion, uint256 floor) = lens.lossLimit(roundId);
+            assertTrue(_within(cushion, d.cushion[i]), "the cushion differs from the reference");
+            assertEq(floor, HOUSE_CAPITAL * 7 / 10, "the loss limit's floor: 70% of the capital");
+            if (cushion < t.lowestCushion) t.lowestCushion = cushion;
+        }
+        uint256 diff = chips > d.chips[i] ? chips - d.chips[i] : d.chips[i] - chips;
+        uint256 rel = d.chips[i] == 0 ? 0 : diff * 1e18 / d.chips[i];
+        if (rel > t.worstRel) t.worstRel = rel;
+        if (d.isBuy[i]) {
+            t.paid += chips;
+            t.drift += int256(chips) - int256(d.chips[i]);
+        } else {
+            t.received += chips;
+            t.drift += int256(d.chips[i]) - int256(chips);
+        }
+    }
+
     function test_daySim_everyFillAndTheHouseResult_matchTheReference() public {
+        _useKeeperClosedTicker();
         Day memory d = _load();
         assertEq(d.trades, 96);
         // the reference assumes the book's default round on the default stock clock, opened a minute
@@ -155,76 +228,21 @@ contract DaySimTest is IntegrationFixture {
         assertEq(d.offset[36], 63_000, "a fill in the first second of the regular session");
         assertEq(d.offset[95], 86_400 - 630, "a fill at the cutoff");
 
-        uint256 worstRel;
-        uint256 worstRho;
-        uint256 paid;
-        uint256 received;
-        int256 drift; // sum of (contract - reference), in the house's favour when positive
-        uint256 fills;
-        uint256 minPriced;
-        uint256 lowestCushion = type(uint256).max;
+        Tally memory t;
+        t.lowestCushion = type(uint256).max;
         for (uint256 i; i < d.trades; ++i) {
-            // the commit is made two seconds before the print that prices it
-            _warp(prevClose + uint64(d.offset[i]) - 2);
-            uint8 product = uint8(d.product[i]);
-            uint256 fee;
-            uint256 pBefore;
-            RefundReason verdict;
-            (, fee, pBefore,,, verdict) =
-                lens.quote(roundId, product, d.isBuy[i], d.shares[i], d.price[i], clock + 2);
-            assertEq(uint8(verdict), uint8(RefundReason.None), "nothing is refused on this day");
-            uint256 chips = d.isBuy[i]
-                ? _buy(alice, product, d.shares[i], d.price[i])
-                : _sell(alice, product, d.shares[i], d.price[i]);
-            assertEq(clock, prevClose + d.offset[i], "filled at the print the reference priced");
-            ++fills;
-            if (d.minPriced[i]) {
-                // charged the minimum price: exactly two hundredths of a chip per token before the fee
-                assertEq(chips - fee, d.shares[i] * 2 / 100, "the minimum price, to the unit");
-                assertLt(pBefore, 0.02e18, "the engine asked less");
-                ++minPriced;
-            } else if (d.isBuy[i]) {
-                assertGt(chips - fee, d.shares[i] * 2 / 100, "above the minimum price");
-            }
-            {
-                // the clock at that print: the book's (which the hook used) against the reference's
-                (uint256 rho, bool tradable) = book.clockAt(c.clock, clock);
-                assertTrue(tradable);
-                uint256 rhoDiff = rho > d.rho[i] ? rho - d.rho[i] : d.rho[i] - rho;
-                if (rhoDiff > worstRho) worstRho = rhoDiff;
-                assertLe(rhoDiff, 1e6, "rho differs from the reference by more than rounding");
-            }
-            assertTrue(_within(chips, d.chips[i]), "a fill differs from the reference by more than rounding");
-            assertTrue(_within(fee, d.fee[i]), "a fee differs from the reference by more than rounding");
-            {
-                // the house's worst-band cushion after the fill, against the reference's; it never
-                // comes near the loss limit's floor on this day
-                (uint256 cushion, uint256 floor) = lens.lossLimit(roundId);
-                assertTrue(_within(cushion, d.cushion[i]), "the cushion differs from the reference");
-                assertEq(floor, HOUSE_CAPITAL * 7 / 10, "the loss limit's floor: 70% of the capital");
-                if (cushion < lowestCushion) lowestCushion = cushion;
-            }
-            uint256 diff = chips > d.chips[i] ? chips - d.chips[i] : d.chips[i] - chips;
-            uint256 rel = d.chips[i] == 0 ? 0 : diff * 1e18 / d.chips[i];
-            if (rel > worstRel) worstRel = rel;
-            if (d.isBuy[i]) {
-                paid += chips;
-                drift += int256(chips) - int256(d.chips[i]);
-            } else {
-                received += chips;
-                drift += int256(d.chips[i]) - int256(chips);
-            }
+            _trade(d, c, prevClose, i, t);
         }
-        assertEq(fills, d.trades, "every trade of the day filled");
-        assertEq(minPriced, 13, "buys charged the minimum price");
-        assertTrue(_within(lowestCushion, d.lowestCushion), "the lowest cushion of the day");
-        assertGt(lowestCushion, HOUSE_CAPITAL * 9 / 10, "the day never puts a tenth of the capital at risk");
-        emit log_named_uint("buys charged the minimum price, in both", minPriced);
-        emit log_named_decimal_uint("lowest cushion of the day (chips)", lowestCushion, 18);
-        emit log_named_decimal_uint("worst difference of rho (1 = the whole variance)", worstRho, 18);
-        emit log_named_uint("fills compared", fills);
-        emit log_named_decimal_uint("worst relative difference of a fill (1 = 100%)", worstRel, 18);
-        emit log_named_decimal_int("sum of differences, in the house's favour (chips)", drift, 18);
+        assertEq(t.fills, d.trades, "every trade of the day filled");
+        assertEq(t.minPriced, 13, "buys charged the minimum price");
+        assertTrue(_within(t.lowestCushion, d.lowestCushion), "the lowest cushion of the day");
+        assertGt(t.lowestCushion, HOUSE_CAPITAL * 9 / 10, "the day never puts a tenth of the capital at risk");
+        emit log_named_uint("buys charged the minimum price, in both", t.minPriced);
+        emit log_named_decimal_uint("lowest cushion of the day (chips)", t.lowestCushion, 18);
+        emit log_named_decimal_uint("worst difference of rho (1 = the whole variance)", t.worstRho, 18);
+        emit log_named_uint("fills compared", t.fills);
+        emit log_named_decimal_uint("worst relative difference of a fill (1 = 100%)", t.worstRel, 18);
+        emit log_named_decimal_int("sum of differences, in the house's favour (chips)", t.drift, 18);
 
         // the state the day ends in
         IFallpitHook.RoundState memory open = _state();
@@ -232,7 +250,7 @@ contract DaySimTest is IntegrationFixture {
         assertTrue(_within(open.held, d.heldAtClose), "chips held at the close");
         assertTrue(_within(open.protocolFees, d.protocolFees), "protocol fees");
         {
-            (uint256[12] memory supply,) = hook.getSupplies(roundId);
+            (uint256[15] memory supply,) = hook.getSupplies(roundId);
             for (uint256 i; i < PRODUCTS; ++i) {
                 assertEq(supply[i], d.supplyAtClose[i], "outstanding supply of every product, to the unit");
             }
@@ -260,7 +278,7 @@ contract DaySimTest is IntegrationFixture {
         emit log_named_decimal_int("house result, contracts (chips)", houseResult, 18);
         emit log_named_decimal_int("difference (chips)", gap, 18);
         // the house result is a small difference of large sums: compare it against the day's volume
-        uint256 volume = paid + received;
+        uint256 volume = t.paid + t.received;
         assertLe(gap < 0 ? uint256(-gap) : uint256(gap), volume / REL_TOL + ABS_TOL, "house result");
         // every rounding goes against the trader, but the protocol's fee share is rounded down per fill,
         // so nothing is asserted about the sign of the gap beyond the tolerance

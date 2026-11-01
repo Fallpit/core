@@ -29,7 +29,36 @@ library PitMath {
     /// @dev A product that covers at least this many bands (half the ladder) has no product cap.
     uint256 internal constant HALF_LADDER = 20;
     uint256 internal constant MIN_PRODUCTS = 2;
-    uint256 internal constant MAX_PRODUCTS = 12;
+    /// @dev Most products a menu the book accepts may have (the menu a round opens with).
+    uint256 internal constant MAX_MENU = 12;
+    /// @dev Most products a round may have: its menu and its live strikes (two products each). The menu
+    ///      word holds 15 runs (8 + 15 * 16 = 248 bits) and the winners mask 16.
+    uint256 internal constant MAX_PRODUCTS = 15;
+    /// @dev Inner edge of the HIGHER / LOWER pair of the default menu (`[0, 19]` and `[20, 39]`).
+    uint8 internal constant PAIR_EDGE = 19;
+    uint8 internal constant LAST_EDGE = 38;
+    /// @dev A strike opens only once at most this much of the round's variance is still ahead (WAD).
+    uint256 internal constant STRIKE_MAX_RHO = 0.5e18;
+    /// @dev A strike's edge is at least this many edges from the pair's edge and from every open strike.
+    uint256 internal constant STRIKE_SPACING = 2;
+    /// @dev A strike opens only when every pair of the round is pinned: the print is at least this many
+    ///      remaining standard deviations from the pair's edge and from the edge of every open strike
+    ///      (WAD). 0.84 is the 80/20 point of the normal law.
+    uint256 internal constant STRIKE_PIN_Z = 0.84e18;
+    /// @dev The print that opens a strike is of an instant at most this many seconds old, so a caller cannot
+    ///      pick the most extreme print of a long refund window.
+    uint256 internal constant STRIKE_MAX_LAG = 30;
+    /// @dev Bit offset of the base count in a round's stored menu word (see `strikeFrom`).
+    uint256 internal constant BASE_SHIFT = 248;
+
+    /// @dev Why a strike may not open (`strikeCheck`). `None` when it may.
+    enum StrikeRule {
+        None,
+        TooEarly,
+        Spacing,
+        NotPinned,
+        NoRoom
+    }
 
     /// @notice The risk budget of one print (WAD chips): `capital * riskCapBps * g / 1e4`, capital in the
     ///         chip's units (`decimals`), g WAD. Rounded down.
@@ -65,12 +94,78 @@ library PitMath {
     ///         stored above the last product.
     function validMenu(uint256 menu) internal pure returns (bool) {
         uint256 n = count(menu);
-        if (n < MIN_PRODUCTS || n > MAX_PRODUCTS || menu >> (8 + 16 * n) != 0) return false;
+        if (n < MIN_PRODUCTS || n > MAX_MENU || menu >> (8 + 16 * n) != 0) return false;
         for (uint256 i; i < n; ++i) {
             (uint8 lo, uint8 hi) = run(menu, i);
             if (lo > hi || hi > LAST_BAND) return false;
         }
         return true;
+    }
+
+    /// @notice Number of products the round opened with: the products from this index on are its live
+    ///         strikes. A round's stored menu keeps it in its top byte once a strike opens (0 before, when
+    ///         every product is from the open).
+    function strikeFrom(uint256 menu) internal pure returns (uint256) {
+        uint256 base = menu >> BASE_SHIFT;
+        return base == 0 ? count(menu) : base;
+    }
+
+    /// @notice `menu` with the strike on inner edge `m` appended: `[0, m]` (its LOWER side, index n) and
+    ///         `[m + 1, 39]` (its HIGHER side, index n + 1), the base count kept in the top byte. The caller
+    ///         has checked the room (`strikeCheck`).
+    function addStrike(uint256 menu, uint8 m) internal pure returns (uint256) {
+        uint256 n = count(menu);
+        uint256 base = strikeFrom(menu);
+        uint256 runs = menu & ((uint256(1) << BASE_SHIFT) - 1) & ~uint256(0xff);
+        runs |= uint256(m) << 8 << (8 + 16 * n);
+        runs |= (uint256(m) + 1 | uint256(LAST_BAND) << 8) << (8 + 16 * (n + 1));
+        return runs | (n + 2) | base << BASE_SHIFT;
+    }
+
+    /// @notice Whether a strike on inner edge `m` may open in a round with stored menu `menu` at a print
+    ///         with `rho` of the round's variance still ahead, log return `x` and remaining standard deviation
+    ///         `sd` (`context`): at most half of the variance ahead; `m` at least two edges from the pair's
+    ///         edge 19 and from the edge of every open strike; every pair pinned (the print at least
+    ///         `STRIKE_PIN_Z * sd` from edge 19 and from every open strike's edge, edges on the round's frozen
+    ///         `sigma`); and room in the menu for two more products.
+    function strikeCheck(uint256 menu, uint8 m, uint256 rho, uint256 sigma, int256 x, uint256 sd)
+        internal
+        pure
+        returns (StrikeRule)
+    {
+        if (rho > STRIKE_MAX_RHO) return StrikeRule.TooEarly;
+        if (_apart(m, PAIR_EDGE) < STRIKE_SPACING) return StrikeRule.Spacing;
+        uint256 n = count(menu);
+        uint256 pin = sd.mulWad(STRIKE_PIN_Z);
+        if (FixedPointMathLib.dist(edge(sigma, PAIR_EDGE), x) < pin) return StrikeRule.NotPinned;
+        for (uint256 i = strikeFrom(menu); i < n; i += 2) {
+            (, uint8 edgeOf) = run(menu, i);
+            if (_apart(m, edgeOf) < STRIKE_SPACING) return StrikeRule.Spacing;
+            if (FixedPointMathLib.dist(edge(sigma, edgeOf), x) < pin) return StrikeRule.NotPinned;
+        }
+        if (n + 2 > MAX_PRODUCTS) return StrikeRule.NoRoom;
+        return StrikeRule.None;
+    }
+
+    /// @notice The inner edge (0..38) of a round's grid nearest to the log return `x`: the m with the
+    ///         least |edge(sigma, m) - x|, the lower one on a tie.
+    function nearestEdge(uint256 sigma, int256 x) internal pure returns (uint8) {
+        // the grid step puts the nearest edge at q or next to it; the exact edges decide
+        int256 q = x * 4 / int256(sigma) + int256(uint256(PAIR_EDGE));
+        if (q < 0) q = 0;
+        if (q > int256(uint256(LAST_EDGE))) q = int256(uint256(LAST_EDGE));
+        uint256 best = uint256(q) == 0 ? 0 : uint256(q) - 1;
+        uint256 top = uint256(q) == LAST_EDGE ? LAST_EDGE : uint256(q) + 1;
+        uint256 bestGap = FixedPointMathLib.dist(edge(sigma, best), x);
+        for (uint256 k = best + 1; k <= top; ++k) {
+            uint256 gap = FixedPointMathLib.dist(edge(sigma, k), x);
+            if (gap < bestGap) (best, bestGap) = (k, gap);
+        }
+        return uint8(best);
+    }
+
+    function _apart(uint8 a, uint8 b) private pure returns (uint256) {
+        return a > b ? a - b : b - a;
     }
 
     /// @notice True when a product on `[lo, hi]` is under the product cap: it is narrower than half the
@@ -92,6 +187,14 @@ library PitMath {
     /// @notice Log return of inner edge m (0..38): `(m - 19) * sigma / 4`, as `ILadderMath.edge` rounds it.
     function edge(uint256 sigma, uint256 m) internal pure returns (int256) {
         return (int256(m) - 19) * int256(sigma) / 4;
+    }
+
+    /// @notice Band (0..39) of the log return `x` on the grid of `sigma`: the number of inner edges at or
+    ///         below `x`, as `ILadderMath.bandOf` gives it (the same scan of `edge`).
+    function bandOf(uint256 sigma, int256 x) internal pure returns (uint8 band) {
+        while (band < BANDS - 1 && edge(sigma, band) <= x) {
+            ++band;
+        }
     }
 
     /// @notice Price range of a product on `[lo, hi]` of a round that starts from `s0` with `sigma`: the
@@ -120,8 +223,17 @@ library PitMath {
         }
     }
 
+    /// @notice The supplies of the products of `menu` from a round's 128-bit storage, the rest zero: reads
+    ///         only the slots the menu uses.
+    function supplyOf(uint128[15] storage supply, uint256 menu) internal view returns (uint256[15] memory s) {
+        uint256 n = count(menu);
+        for (uint256 i; i < n; ++i) {
+            s[i] = supply[i];
+        }
+    }
+
     /// @notice Sum of the supplies of the products in `mask`.
-    function payoutOf(uint256[12] memory supply, uint16 mask) internal pure returns (uint256 sum) {
+    function payoutOf(uint256[15] memory supply, uint16 mask) internal pure returns (uint256 sum) {
         for (uint256 i; i < MAX_PRODUCTS; ++i) {
             if (mask >> i & 1 == 1) sum += supply[i];
         }
@@ -131,7 +243,7 @@ library PitMath {
     ///         the supplies of every product whose run contains j.
     /// @dev A difference array over the bands: each product adds its supply at `lo` and takes it off
     ///      after `hi`; the running sum is the payout of each band.
-    function maxPayout(uint256[12] memory supply, uint256 menu) internal pure returns (uint256 worst) {
+    function maxPayout(uint256[15] memory supply, uint256 menu) internal pure returns (uint256 worst) {
         int256[41] memory step;
         uint256 n = count(menu);
         for (uint256 i; i < n; ++i) {
@@ -156,7 +268,7 @@ library PitMath {
     ///           exempt: a holder can always exit.
     /// @return `RefundReason.None` when the fill may stand, else the reason it is rejected for
     function postFillCheck(
-        uint256[12] memory supply,
+        uint256[15] memory supply,
         uint256 menu,
         uint256 held,
         uint256 protocolFees,

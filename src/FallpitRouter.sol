@@ -8,25 +8,15 @@ import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {Currency} from "v4-core/types/Currency.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
+import {SafeCastLib} from "solady/utils/SafeCastLib.sol";
 import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
 import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
-import {SignatureCheckerLib} from "solady/utils/SignatureCheckerLib.sol";
 
 import {IFallpitHook, RefundReason} from "./interfaces/IFallpitHook.sol";
 import {IFallpitRouter} from "./interfaces/IFallpitRouter.sol";
 import {IPitVault} from "./interfaces/IPitVault.sol";
 import {IPitLister} from "./interfaces/IPitLister.sol";
-
-/// @dev The views of the hook the router reads to find the vault and the book.
-interface IVaultOf {
-    function vault() external view returns (IPitVault);
-    function book() external view returns (address);
-}
-
-/// @dev The book's owner (the owner multisig), who may set the ETH pools.
-interface IOwnerOf {
-    function owner() external view returns (address);
-}
+import {EthPool, SessionLogic, SessionStore} from "./router/SessionLogic.sol";
 
 /// @dev The hook's ERC-6909 tickets, as the router uses them.
 interface IERC6909Balance {
@@ -113,34 +103,17 @@ contract FallpitRouter is IFallpitRouter, IUnlockCallback {
     ///      reverts, is not paid in the call: its coin waits in `ethOwed`.
     uint256 private constant ETH_GAS = 100_000;
     /// @notice Longest session a user can grant.
-    uint256 public constant MAX_SESSION = 7 days;
-
-    bytes32 private constant DOMAIN_TYPEHASH =
-        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
-    bytes32 private constant NAME_HASH = keccak256("Fallpit Router");
-    bytes32 private constant VERSION_HASH = keccak256("1");
-    bytes32 private constant GRANT_TYPEHASH = keccak256(
-        "SessionGrant(address user,address key,uint64 expiry,uint256 maxPerOrder,uint256 maxTotal,uint8 scope,uint256 nonce)"
-    );
-    bytes32 private constant ORDER_TYPEHASH = keccak256(
-        "Order(address user,bytes32 roundId,uint8 product,bool isBuy,uint256 shares,uint256 limit,uint64 deadline,uint256 nonce)"
-    );
-    bytes32 private constant VAULT_OP_TYPEHASH = keccak256(
-        "VaultOp(address user,uint8 op,bytes32 house,uint256 amount,uint256 minOut,uint64 deadline,uint256 nonce)"
-    );
-    bytes32 private constant CANCEL_TYPEHASH = keccak256("CancelOrder(address user,uint256 nonce)");
-    bytes32 private constant LIST_OP_TYPEHASH =
-        keccak256("ListOp(address user,address chip,uint256 seed,uint64 deadline,uint256 nonce)");
+    uint256 public constant MAX_SESSION = SessionLogic.MAX_SESSION;
 
     /// @notice `SessionGrant.scope` bits: trade (`commitWithSig`) and vault (`vaultWithSig`).
-    uint8 public constant SCOPE_TRADE = 1;
-    uint8 public constant SCOPE_VAULT = 2;
+    uint8 public constant SCOPE_TRADE = SessionLogic.SCOPE_TRADE;
+    uint8 public constant SCOPE_VAULT = SessionLogic.SCOPE_VAULT;
 
     /// @notice `VaultOp.op` values.
-    uint8 public constant VAULT_DEPOSIT = 0;
-    uint8 public constant VAULT_CANCEL_DEPOSIT = 1;
-    uint8 public constant VAULT_REQUEST_WITHDRAW = 2;
-    uint8 public constant VAULT_CLAIM = 3;
+    uint8 public constant VAULT_DEPOSIT = SessionLogic.VAULT_DEPOSIT;
+    uint8 public constant VAULT_CANCEL_DEPOSIT = SessionLogic.VAULT_CANCEL_DEPOSIT;
+    uint8 public constant VAULT_REQUEST_WITHDRAW = SessionLogic.VAULT_REQUEST_WITHDRAW;
+    uint8 public constant VAULT_CLAIM = SessionLogic.VAULT_CLAIM;
 
     /// @dev Where the escrow of a commit comes from.
     uint8 private constant FROM_USER = 0; // a buy: the user's approval to this router; a sell: `hook.pull`
@@ -171,45 +144,56 @@ contract FallpitRouter is IFallpitRouter, IUnlockCallback {
     mapping(address account => uint256) public ethOwed;
     /// @dev The newest commit of a round and its fill instant: the `prev` of the round's next commit.
     mapping(bytes32 roundId => LastCommit) internal _lastCommit;
+    /// @dev The chip, fill fee and refund window of each round with a commit (`RoundTerms`).
+    mapping(bytes32 roundId => RoundTerms) internal _terms;
 
-    mapping(address user => mapping(address key => Session)) internal _sessions;
-    /// @inheritdoc IFallpitRouter
-    mapping(address user => uint256) public sessionNonce;
-    /// @notice Grants already submitted, by digest: a revoked session cannot be revived with its old grant.
-    mapping(bytes32 digest => bool) public grantUsed;
-    mapping(address user => mapping(uint256 word => uint256 bits)) internal _orderBits;
+    /// @dev Sessions, their nonces, grants and spending, and the order nonce bitmaps (`SessionLogic`).
+    SessionStore internal _ss;
     /// @inheritdoc IFallpitRouter
     mapping(uint256 commitId => address) public feePayerOf;
     /// @dev Pool overrides per chip for `commitWithEth`; `tickSpacing` zero: the default pool.
     mapping(address chip => EthPool) internal _ethPools;
-    /// @dev Grants submitted per (user, key): `sessionSpent` counts per grant, so a new grant starts at zero.
-    mapping(address user => mapping(address key => uint256)) internal _grantCount;
-    mapping(
-        address user => mapping(address key => mapping(uint256 grant => mapping(address coin => uint256)))
-    ) internal _spent;
 
     /// @dev A commit as stored: `IFallpitRouter.Commit` without `escrow`, which is always
-    ///      `isBuy ? limit : shares` (`_escrowOf`), plus `relayed` (true when `feePayerOf` is set, so a fill
-    ///      reads `feePayerOf` only then). Five slots.
+    ///      `isBuy ? limit : shares` (`_escrowOf`), and without what its round fixes for all its commits
+    ///      (`RoundTerms`), plus `relayed` (true when `feePayerOf` is set, so a fill reads `feePayerOf` only
+    ///      then). Three slots: the fill instant in 40 bits (seconds, enough for thousands of years), the
+    ///      earlier commit as its distance back in commit ids (`prevGap`, 0 for none; commits that can hold
+    ///      each other are seconds apart, far fewer than 2^32 ids), and the limit in 128 bits (a commit
+    ///      with a larger limit is refused).
     struct StoredCommit {
         address user;
-        uint64 fillTs;
+        uint40 fillTs;
         CommitStatus status;
         bool isBuy;
         bool relayed;
+        uint32 prevGap;
         uint256 id;
+        uint128 shares;
+        uint128 limit;
+    }
+
+    /// @dev What a round fixes for every commit on it (frozen in the round's config: `commitContext`),
+    ///      stored once by the round's first commit: its chip, fill fee and refund window.
+    struct RoundTerms {
         address chip;
         uint64 fillFee;
         uint32 refundDelay;
-        uint128 shares;
-        uint96 prev;
-        uint256 limit;
     }
 
-    struct EthPool {
-        uint24 fee;
-        int24 tickSpacing;
-        address hooks;
+    /// @dev What `_commit` needs from the hook about a commit's round and product (`commitContext`), and
+    ///      the commit's fill instant once stored.
+    struct CommitContext {
+        IFallpitHook hook;
+        uint256 id;
+        address chip;
+        bool tradable;
+        uint32 fillDelay;
+        uint32 refundDelay;
+        uint256 minShares;
+        uint64 fillFee;
+        bool isOpen;
+        uint64 fillTs;
     }
 
     struct LastCommit {
@@ -227,6 +211,12 @@ contract FallpitRouter is IFallpitRouter, IUnlockCallback {
     constructor(IPoolManager poolManager_) {
         poolManager = poolManager_;
         deployer = msg.sender;
+    }
+
+    /// @notice Only the hook sends ETH here: what the oracle did not spend of a filler's ETH, which `fill`
+    ///         passes on to the filler.
+    receive() external payable {
+        if (msg.sender != address(hook)) revert EthNotAccepted();
     }
 
     /// @inheritdoc IFallpitRouter
@@ -286,17 +276,27 @@ contract FallpitRouter is IFallpitRouter, IUnlockCallback {
         uint64 deadline
     ) external payable nonReentrant returns (uint256 commitId) {
         if (block.timestamp > deadline) revert OrderExpired();
-        IFallpitHook hook_ = hook;
-        if (address(hook_) == address(0)) revert HookNotSet();
-        (uint256 id, address chip,,,,, uint64 fillFee,) = hook_.commitContext(roundId, product);
-        if (id == 0) revert UnknownProduct();
-        if (msg.value <= fillFee) revert WrongFillFee();
-        uint256 ethIn = msg.value - fillFee;
+        address chip;
+        uint64 fillFee;
+        uint256 ethIn;
+        {
+            IFallpitHook hook_ = hook;
+            if (address(hook_) == address(0)) revert HookNotSet();
+            uint256 id;
+            (id, chip,,,,, fillFee,) = hook_.commitContext(roundId, product);
+            if (id == 0) revert UnknownProduct();
+            if (msg.value <= fillFee) revert WrongFillFee();
+            ethIn = msg.value - fillFee;
+        }
 
-        uint256 before = chip.balanceOf(address(this));
-        uint256 ethLeft =
-            abi.decode(poolManager.unlock(abi.encode(uint256(0), abi.encode(chip), ethIn)), (uint256));
-        uint256 chips = chip.balanceOf(address(this)) - before;
+        uint256 ethLeft;
+        uint256 chips;
+        {
+            uint256 before = chip.balanceOf(address(this));
+            ethLeft =
+                abi.decode(poolManager.unlock(abi.encode(uint256(0), abi.encode(chip), ethIn)), (uint256));
+            chips = chip.balanceOf(address(this)) - before;
+        }
         if (chips == 0 || chips < minChips) revert TooFewChips(chips, minChips);
 
         // The buy spends at most `limit`; the chips above it are the caller's at once.
@@ -322,36 +322,56 @@ contract FallpitRouter is IFallpitRouter, IUnlockCallback {
         uint8 source,
         uint256 feeIn
     ) private returns (uint256 commitId) {
-        IFallpitHook hook_ = hook;
-        if (address(hook_) == address(0)) revert HookNotSet();
-        (
-            uint256 id,
-            address chip,
-            bool tradable,
-            uint32 fillDelay,
-            uint32 refundDelay,
-            uint256 minShares,
-            uint64 fillFee,
-            bool isOpen
-        ) = hook_.commitContext(roundId, product);
-        if (!isOpen) revert RoundNotOpen();
-        if (id == 0) revert UnknownProduct();
-        // The filler's pay travels with the commit: exactly the round's fee, no more and no less.
-        if (feeIn != fillFee) revert WrongFillFee();
-        // The instant the commit is priced at must be inside a trading window of the round's clock.
-        if (!tradable) revert OutsideTradingWindow();
-        if (shares == 0 || shares > uint128(type(int128).max)) revert ZeroAmount();
-        // Dust costs its sender little and whoever fills it a full pricing run.
-        if (shares < minShares) revert BelowMinimumTrade();
+        CommitContext memory k = _commitContext(roundId, product, shares, feeIn);
 
         // Escrow. Chips by balance difference, and it must be exactly what was sent: a chip that taxes its
         // transfers cannot trade. Tickets move inside the hook, exactly.
         uint256 escrow = isBuy ? limit : shares;
         if (escrow == 0) revert ZeroAmount();
+        _escrowIn(user, k, isBuy, shares, limit, source, escrow);
+
+        commitId = _store(user, roundId, isBuy, shares, limit, k);
+        emit Committed(commitId, user, roundId, product, isBuy, shares, limit, escrow, k.fillTs);
+    }
+
+    /// @dev The hook's context of a commit to `product` of `roundId`, checked: the round is open and
+    ///      trades now, the product exists, `feeIn` is the round's fill fee, and `shares` is in range.
+    function _commitContext(bytes32 roundId, uint8 product, uint256 shares, uint256 feeIn)
+        private
+        view
+        returns (CommitContext memory k)
+    {
+        k.hook = hook;
+        if (address(k.hook) == address(0)) revert HookNotSet();
+        (k.id, k.chip, k.tradable, k.fillDelay, k.refundDelay, k.minShares, k.fillFee, k.isOpen) =
+            k.hook.commitContext(roundId, product);
+        if (!k.isOpen) revert RoundNotOpen();
+        if (k.id == 0) revert UnknownProduct();
+        // The filler's pay travels with the commit: exactly the round's fee, no more and no less.
+        if (feeIn != k.fillFee) revert WrongFillFee();
+        // The instant the commit is priced at must be inside a trading window of the round's clock.
+        if (!k.tradable) revert OutsideTradingWindow();
+        if (shares == 0 || shares > uint128(type(int128).max)) revert ZeroAmount();
+        // Dust costs its sender little and whoever fills it a full pricing run.
+        if (shares < k.minShares) revert BelowMinimumTrade();
+    }
+
+    /// @dev Takes a commit's escrow: a sell's tickets through `hook.pull`, a buy's chips from `user` unless
+    ///      `source` is `FROM_HERE`.
+    function _escrowIn(
+        address user,
+        CommitContext memory k,
+        bool isBuy,
+        uint256 shares,
+        uint256 limit,
+        uint8 source,
+        uint256 escrow
+    ) private {
         if (!isBuy) {
-            hook_.pull(user, id, shares);
-            _escrowedTickets[id] = _orOne(_escrowedTickets[id]) + shares;
+            k.hook.pull(user, k.id, shares);
+            _escrowedTickets[k.id] = _orOne(_escrowedTickets[k.id]) + shares;
         } else {
+            address chip = k.chip;
             if (source != FROM_HERE) {
                 uint256 before = chip.balanceOf(address(this));
                 chip.safeTransferFrom(user, address(this), limit);
@@ -359,27 +379,39 @@ contract FallpitRouter is IFallpitRouter, IUnlockCallback {
             }
             _escrowed[chip] = _orOne(_escrowed[chip]) + escrow;
         }
+    }
 
+    /// @dev Stores a new pending commit and links it to the round's previous one. Sets `k.fillTs`.
+    function _store(
+        address user,
+        bytes32 roundId,
+        bool isBuy,
+        uint256 shares,
+        uint256 limit,
+        CommitContext memory k
+    ) private returns (uint256 commitId) {
         commitId = nextCommitId++;
-        uint64 fillTs = uint64(block.timestamp) + fillDelay;
+        uint64 fillTs = uint64(block.timestamp) + k.fillDelay;
+        k.fillTs = fillTs;
         LastCommit memory lc = _lastCommit[roundId];
         _lastCommit[roundId] = LastCommit({fillTs: fillTs, id: uint192(commitId)});
-        _commits[commitId] = StoredCommit({
-            user: user,
-            fillTs: fillTs,
-            status: CommitStatus.Pending,
-            isBuy: isBuy,
-            id: id,
-            chip: chip,
-            fillFee: fillFee,
-            refundDelay: refundDelay,
-            relayed: false,
-            shares: uint128(shares),
-            // the round's previous commit, while its fill window overlaps this one's (fill instants only grow)
-            prev: uint256(lc.fillTs) + refundDelay >= fillTs ? uint96(lc.id) : 0,
-            limit: limit
-        });
-        emit Committed(commitId, user, roundId, product, isBuy, shares, limit, escrow, fillTs);
+        StoredCommit memory c;
+        c.user = user;
+        c.fillTs = uint40(fillTs);
+        c.status = CommitStatus.Pending;
+        c.isBuy = isBuy;
+        c.id = k.id;
+        c.relayed = false;
+        RoundTerms storage tm = _terms[roundId];
+        if (tm.chip == address(0)) {
+            (tm.chip, tm.fillFee, tm.refundDelay) = (k.chip, k.fillFee, k.refundDelay);
+        }
+        c.shares = uint128(shares);
+        // the round's previous commit, while its fill window overlaps this one's (fill instants only grow)
+        if (uint256(lc.fillTs) + k.refundDelay >= fillTs) c.prevGap = SafeCastLib.toUint32(commitId - lc.id);
+        if (limit > type(uint128).max) revert LimitTooLarge();
+        c.limit = uint128(limit);
+        _commits[commitId] = c;
     }
 
     /// @inheritdoc IFallpitRouter
@@ -398,75 +430,139 @@ contract FallpitRouter is IFallpitRouter, IUnlockCallback {
         nonReentrant
         returns (bool filled)
     {
-        StoredCommit storage c = _commits[commitId];
-        if (c.status != CommitStatus.Pending) revert CommitNotPending();
-        if (block.timestamp < c.fillTs) revert TooEarly();
-        if (block.timestamp > uint256(c.fillTs) + c.refundDelay) revert FillWindowClosed();
-        uint256 prev = c.prev;
-        if (prev != 0) {
-            // The earlier commit holds this one while it is pending and can still be filled. Its window
-            // ends first (same round: same `refundDelay`, an earlier or equal fill instant); after that
-            // it can only be refunded and holds nobody.
-            StoredCommit storage p = _commits[prev];
-            if (p.status == CommitStatus.Pending && block.timestamp <= uint256(p.fillTs) + c.refundDelay) {
-                revert EarlierCommitPending(prev);
-            }
-        }
+        return _fillOne(commitId, report, msg.value, false);
+    }
 
-        address user = c.user;
+    /// @inheritdoc IFallpitRouter
+    /// @dev The commits run in the order given, each exactly as `fill` with no ETH: the same checks, the
+    ///      same events, the same fee and refund. A commit that is not pending, not due yet, past its
+    ///      window, held by an earlier pending commit, or whose fill fails with an error that is not a final
+    ///      rejection is skipped (false, and the commit stays as it was) instead of reverting the batch.
+    ///      Later fills of a round in the same transaction read warm storage, so a batch costs less than
+    ///      the fills one by one.
+    function fillBatch(uint256[] calldata commitIds, bytes[] calldata reports)
+        external
+        nonReentrant
+        returns (bool[] memory filled)
+    {
+        uint256 n = commitIds.length;
+        if (reports.length != n) revert LengthMismatch();
+        filled = new bool[](n);
+        for (uint256 i; i < n; ++i) {
+            filled[i] = _fillOne(commitIds[i], reports[i], 0, true);
+        }
+    }
+
+    /// @dev One fill (`fill`, or one entry of `fillBatch` when `soft`: then every reason not to fill or
+    ///      a fill error that is not final returns false and leaves the commit pending).
+    function _fillOne(uint256 commitId, bytes calldata report, uint256 value, bool soft)
+        private
+        returns (bool)
+    {
+        StoredCommit storage c = _commits[commitId];
+        RoundTerms storage tm = _termsOf(c.id);
+        if (!_due(c, tm, commitId, soft)) return false;
+
         uint256 escrow = _escrowOf(c);
-        uint256 fee = c.fillFee;
         // A relayed commit's fee goes back to its payer, unless the payer fills: else anyone (the user
         // too) could fill relayed commits first and take the relayer's fees.
         address payer = c.relayed ? feePayerOf[commitId] : address(0);
         if (payer == msg.sender) payer = address(0);
         c.status = CommitStatus.Filled;
-        _release(c, escrow);
 
-        try this.execute{value: msg.value}(commitId, report) returns (uint256 chips) {
-            emit Filled(commitId, user, chips);
-            _payFillFee(commitId, payer == address(0) ? msg.sender : payer, fee, 0);
+        // the router's ETH without the filler's: what the hook sends back above it is the filler's
+        uint256 base = address(this).balance - value;
+        try this.execute{value: value}(commitId, report) returns (uint256 chips) {
+            // the escrow counters are read by views only, so they move after the call (a skipped commit
+            // in a batch then needs no undo)
+            _release(c, tm, escrow);
+            emit Filled(commitId, c.user, chips);
+            _payFiller(commitId, payer, tm.fillFee, address(this).balance - base);
             return true;
         } catch (bytes memory err) {
             // Everything inside `execute` was rolled back; the escrow is still here.
             RefundReason reason = _refundReason(err);
             if (reason == RefundReason.None) {
+                if (soft) {
+                    // a batch skips it: the commit is pending again
+                    c.status = CommitStatus.Pending;
+                    return false;
+                }
                 assembly ("memory-safe") {
                     revert(add(err, 0x20), mload(err))
                 }
             }
             c.status = CommitStatus.Refunded;
-            _returnEscrow(c, user, escrow);
-            emit Refunded(commitId, user, reason);
+            _release(c, tm, escrow);
+            _returnEscrow(c, tm, c.user, escrow);
+            emit Refunded(commitId, c.user, reason);
             // The filler did the work of a fill that could never succeed: the fee is theirs, and the
             // ETH they sent for the oracle comes back with it. A relayed commit's fee goes back to its
             // payer instead (see above).
-            if (payer == address(0)) {
-                _payFillFee(commitId, msg.sender, fee, msg.value);
-            } else {
-                _payFillFee(commitId, payer, fee, 0);
-                _payFillFee(commitId, msg.sender, 0, msg.value);
-            }
+            _payFiller(commitId, payer, tm.fillFee, value);
             return false;
         }
+    }
+
+    /// @dev True when the commit may be filled now; otherwise false when `soft`, else the reason as a
+    ///      revert.
+    function _due(StoredCommit storage c, RoundTerms storage tm, uint256 commitId, bool soft)
+        private
+        view
+        returns (bool)
+    {
+        bytes4 why;
+        uint256 prev;
+        if (c.status != CommitStatus.Pending) {
+            why = CommitNotPending.selector;
+        } else if (block.timestamp < c.fillTs) {
+            why = TooEarly.selector;
+        } else if (block.timestamp > uint256(c.fillTs) + tm.refundDelay) {
+            why = FillWindowClosed.selector;
+        } else if ((prev = _prevOf(c, commitId)) != 0) {
+            // The earlier commit holds this one while it is pending and can still be filled. Its window
+            // ends first (same round: same `refundDelay`, an earlier or equal fill instant); after that it
+            // can only be refunded and holds nobody.
+            StoredCommit storage p = _commits[prev];
+            if (p.status == CommitStatus.Pending && block.timestamp <= uint256(p.fillTs) + tm.refundDelay) {
+                why = EarlierCommitPending.selector;
+            }
+        }
+        if (why == 0) return true;
+        if (soft) return false;
+        if (why == EarlierCommitPending.selector) revert EarlierCommitPending(prev);
+        assembly ("memory-safe") {
+            mstore(0, why)
+            revert(0, 4)
+        }
+    }
+
+    /// @dev The fill fee to the filler (or to the relayed commit's payer) and `back`, the filler's own ETH,
+    ///      to the filler.
+    function _payFiller(uint256 commitId, address payer, uint256 fee, uint256 back) private {
+        if (payer != address(0)) {
+            _payFillFee(commitId, payer, fee, 0);
+            fee = 0;
+        }
+        _payFillFee(commitId, msg.sender, fee, back);
     }
 
     /// @inheritdoc IFallpitRouter
     function refund(uint256 commitId) external nonReentrant {
         StoredCommit storage c = _commits[commitId];
+        RoundTerms storage tm = _termsOf(c.id);
         if (c.status != CommitStatus.Pending) revert CommitNotPending();
-        if (block.timestamp <= uint256(c.fillTs) + c.refundDelay) revert RefundNotDue();
+        if (block.timestamp <= uint256(c.fillTs) + tm.refundDelay) revert RefundNotDue();
         address user = c.user;
         uint256 escrow = _escrowOf(c);
-        uint256 fee = c.fillFee;
+        uint256 fee = tm.fillFee;
         c.status = CommitStatus.Refunded;
-        _release(c, escrow);
-        _returnEscrow(c, user, escrow);
+        _release(c, tm, escrow);
+        _returnEscrow(c, tm, user, escrow);
         emit Refunded(commitId, user, RefundReason.Expired);
         // Nobody filled: the fill fee goes back to whoever paid it (the trader, or a session's relayer),
         // the escrow to the trader.
-        address payer = c.relayed ? feePayerOf[commitId] : address(0);
-        _payFillFee(commitId, payer == address(0) ? user : payer, fee, 0);
+        _payFillFee(commitId, c.relayed ? feePayerOf[commitId] : user, fee, 0);
     }
 
     /// @inheritdoc IFallpitRouter
@@ -487,60 +583,33 @@ contract FallpitRouter is IFallpitRouter, IUnlockCallback {
 
     /// @inheritdoc IFallpitRouter
     function grantSession(SessionGrant calldata grant, bytes calldata signature) external nonReentrant {
-        if (grant.user == address(0) || grant.key == address(0)) revert ZeroAddress();
-        if (grant.expiry <= block.timestamp || grant.expiry > block.timestamp + MAX_SESSION) {
-            revert BadExpiry();
-        }
-        if (grant.maxPerOrder == 0) revert ZeroAmount();
-        if (grant.scope == 0 || grant.scope > (SCOPE_TRADE | SCOPE_VAULT)) revert BadScope();
-        if (grant.nonce != sessionNonce[grant.user]) revert StaleNonce();
-        bytes32 digest = grantDigest(grant);
-        if (grantUsed[digest]) revert GrantUsed();
-        if (!SignatureCheckerLib.isValidSignatureNowCalldata(grant.user, digest, signature)) {
-            revert BadSignature();
-        }
-        grantUsed[digest] = true;
-        _sessions[grant.user][grant.key] = Session({
-            expiry: grant.expiry,
-            nonce: uint64(grant.nonce),
-            maxPerOrder: uint128(FixedPointMathLib.min(grant.maxPerOrder, type(uint128).max)),
-            maxTotal: uint128(FixedPointMathLib.min(grant.maxTotal, type(uint128).max)),
-            scope: grant.scope
-        });
-        // a new grant counts its spending from zero
-        ++_grantCount[grant.user][grant.key];
-        emit SessionGranted(
-            grant.user, grant.key, grant.expiry, grant.maxPerOrder, grant.maxTotal, grant.scope
-        );
+        SessionLogic.grant(_ss, grant, signature);
     }
 
     /// @inheritdoc IFallpitRouter
-    /// @dev Only the expiry is cleared: the session is dead, and its key can still sign `CancelOrder`s.
+    /// @dev Only the expiry is cleared: the session is dead, and its key can still sign `CancelOrder`s. A
+    ///      grant for this key now needs a nonce past the user's current one (`bumpSessionNonce`), so no
+    ///      grant signed before the revocation, relayed or not, can restart the session.
     function revokeSession(address key) external {
-        _sessions[msg.sender][key].expiry = 0;
+        _ss.sessions[msg.sender][key].expiry = 0;
+        _ss.grantFloor[msg.sender][key] = _ss.nonce[msg.sender] + 1;
         emit SessionRevoked(msg.sender, key);
     }
 
     /// @inheritdoc IFallpitRouter
     function cancelWithSig(address user, uint256 nonce, address key, bytes calldata signature) external {
-        Session memory s = _sessions[user][key];
-        if (s.scope == 0 || s.nonce != sessionNonce[user]) revert NotSessionKey();
-        if (!SignatureCheckerLib.isValidSignatureNowCalldata(key, cancelDigest(user, nonce), signature)) {
-            revert BadSignature();
-        }
-        _useNonce(user, nonce);
-        emit OrderCancelled(user, key, nonce, msg.sender);
+        SessionLogic.cancel(_ss, user, nonce, key, signature);
     }
 
     /// @inheritdoc IFallpitRouter
     function useNonces(uint256 word, uint256 mask) external {
-        _orderBits[msg.sender][word] |= mask;
+        _ss.orderBits[msg.sender][word] |= mask;
         emit NoncesUsed(msg.sender, word, mask);
     }
 
     /// @inheritdoc IFallpitRouter
     function bumpSessionNonce() external {
-        uint256 n = ++sessionNonce[msg.sender];
+        uint256 n = ++_ss.nonce[msg.sender];
         emit SessionNonceBumped(msg.sender, n);
     }
 
@@ -552,20 +621,13 @@ contract FallpitRouter is IFallpitRouter, IUnlockCallback {
         returns (uint256 commitId)
     {
         address user = order.user;
-        Session memory s = _useSession(
-            user,
-            key,
-            SCOPE_TRADE,
-            order.isBuy ? order.limit : order.shares,
-            order.deadline,
-            order.nonce,
-            orderDigest(order),
-            signature
-        );
+        uint128 maxTotal = SessionLogic.orderSession(_ss, order, key, signature);
         commitId = _commit(
             user, order.roundId, order.product, order.isBuy, order.shares, order.limit, FROM_USER, msg.value
         );
-        if (order.isBuy) _spend(user, key, s, _commits[commitId].chip, order.limit);
+        if (order.isBuy) {
+            SessionLogic.spend(_ss, user, key, maxTotal, _terms[order.roundId].chip, order.limit);
+        }
         if (msg.sender != user) {
             feePayerOf[commitId] = msg.sender;
             _commits[commitId].relayed = true;
@@ -581,43 +643,7 @@ contract FallpitRouter is IFallpitRouter, IUnlockCallback {
         nonReentrant
         returns (uint256 result)
     {
-        address user = op.user;
-        uint8 kind = op.op;
-        if (kind > VAULT_CLAIM) revert BadVaultOp();
-        Session memory s = _useSession(
-            user,
-            key,
-            SCOPE_VAULT,
-            kind == VAULT_DEPOSIT ? op.amount : 0,
-            op.deadline,
-            op.nonce,
-            vaultOpDigest(op),
-            signature
-        );
-        if (address(hook) == address(0)) revert HookNotSet();
-        IPitVault vault = IVaultOf(address(hook)).vault();
-        bytes32 house = op.house;
-        if (kind == VAULT_DEPOSIT) {
-            address chip = vault.chipOf(house);
-            if (chip == address(0)) revert UnknownHouse();
-            uint256 amount = op.amount;
-            _spend(user, key, s, chip, amount);
-            uint256 before = chip.balanceOf(address(this));
-            chip.safeTransferFrom(user, address(this), amount);
-            if (chip.balanceOf(address(this)) - before != amount) revert BadEscrow();
-            chip.safeApprove(address(vault), amount);
-            // the vault pulls exactly `amount` or reverts, so the router ends with what it held before
-            result = vault.depositFor(house, amount, user);
-        } else if (kind == VAULT_CANCEL_DEPOSIT) {
-            result = vault.cancelDepositFor(house, user);
-        } else if (kind == VAULT_REQUEST_WITHDRAW) {
-            result = vault.requestWithdrawFor(house, op.amount, user);
-        } else {
-            result = vault.claimFor(house, user);
-        }
-        // A withdrawal with `minOut` must pay that much now (a queued one pays 0); a claim at least `minOut`.
-        if (kind >= VAULT_REQUEST_WITHDRAW && result < op.minOut) revert MinOutNotMet(result, op.minOut);
-        emit SessionVaultOp(user, key, kind, house, op.amount, op.nonce, msg.sender, result);
+        return SessionLogic.vaultOp(_ss, op, key, signature, address(hook));
     }
 
     /// @inheritdoc IFallpitRouter
@@ -628,21 +654,7 @@ contract FallpitRouter is IFallpitRouter, IUnlockCallback {
         address key,
         bytes calldata signature
     ) external nonReentrant returns (bytes32 house) {
-        address user = op.user;
-        Session memory s =
-            _useSession(user, key, SCOPE_VAULT, op.seed, op.deadline, op.nonce, listOpDigest(op), signature);
-        if (address(hook) == address(0)) revert HookNotSet();
-        IPitLister lister = IPitLister(IVaultOf(address(hook)).vault().lister());
-        address chip = op.chip;
-        uint256 seed = op.seed;
-        _spend(user, key, s, chip, seed);
-        uint256 before = chip.balanceOf(address(this));
-        chip.safeTransferFrom(user, address(this), seed);
-        if (chip.balanceOf(address(this)) - before != seed) revert BadEscrow();
-        chip.safeApprove(address(lister), seed);
-        // the lister pulls exactly `seed` or reverts, so the router ends with what it held before
-        house = lister.listCoinFor(user, chip, seed, quote, quoteSignature);
-        emit SessionListed(user, key, chip, house, seed, op.nonce, msg.sender);
+        return SessionLogic.list(_ss, op, quote, quoteSignature, key, signature, address(hook));
     }
 
     /// @inheritdoc IFallpitRouter
@@ -657,119 +669,64 @@ contract FallpitRouter is IFallpitRouter, IUnlockCallback {
         return hook_.redeem(id, user, IERC6909Balance(address(hook_)).balanceOf(user, id));
     }
 
-    /// @dev Checks `key`'s live session for `user`, its scope, the deadline, the amount against
-    ///      `maxPerOrder`, the key's signature over `digest`, and uses up `nonce` in the user's bitmap
-    ///      (shared by orders, vault actions and cancels). Returns the session for `_spend`.
-    function _useSession(
-        address user,
-        address key,
-        uint8 scope,
-        uint256 atRisk,
-        uint64 deadline,
-        uint256 nonce,
-        bytes32 digest,
-        bytes calldata signature
-    ) private returns (Session memory s) {
-        s = _sessions[user][key];
-        if (s.expiry < block.timestamp || s.nonce != sessionNonce[user]) revert NoSession();
-        if (s.scope & scope == 0) revert OutOfScope();
-        if (block.timestamp > deadline) revert OrderExpired();
-        if (atRisk > s.maxPerOrder) revert OverSessionCap();
-        if (!SignatureCheckerLib.isValidSignatureNowCalldata(key, digest, signature)) revert BadSignature();
-        _useNonce(user, nonce);
-    }
-
-    /// @dev Adds `amount` of `coin` to what the current session of (`user`, `key`) spent; reverts over its
-    ///      `maxTotal` (0: no cap). Nothing is ever taken off again (refunds included): a safe upper bound.
-    function _spend(address user, address key, Session memory s, address coin, uint256 amount) private {
-        uint256 spent = _spent[user][key][_grantCount[user][key]][coin] += amount;
-        if (s.maxTotal != 0 && spent > s.maxTotal) revert OverSessionTotal(spent, s.maxTotal);
-    }
-
-    /// @dev Uses up `nonce` in `user`'s bitmap, or reverts `OrderUsed`.
-    function _useNonce(address user, uint256 nonce) private {
-        uint256 word = nonce >> 8;
-        uint256 bit = 1 << (nonce & 0xff);
-        uint256 bits = _orderBits[user][word];
-        if (bits & bit != 0) revert OrderUsed();
-        _orderBits[user][word] = bits | bit;
-    }
-
     /// @inheritdoc IFallpitRouter
     function sessionOf(address user, address key) external view returns (Session memory) {
-        return _sessions[user][key];
+        return _ss.sessions[user][key];
     }
 
     /// @inheritdoc IFallpitRouter
     function sessionSpent(address user, address key, address coin) external view returns (uint256) {
-        return _spent[user][key][_grantCount[user][key]][coin];
+        return _ss.spent[user][key][_ss.grantCount[user][key]][coin];
     }
 
     /// @inheritdoc IFallpitRouter
     function orderNonceUsed(address user, uint256 nonce) external view returns (bool) {
-        return _orderBits[user][nonce >> 8] & (1 << (nonce & 0xff)) != 0;
+        return _ss.orderBits[user][nonce >> 8] & (1 << (nonce & 0xff)) != 0;
     }
 
     /// @inheritdoc IFallpitRouter
-    function grantDigest(SessionGrant calldata g) public view returns (bytes32) {
-        return _typed(
-            keccak256(
-                abi.encode(
-                    GRANT_TYPEHASH, g.user, g.key, g.expiry, g.maxPerOrder, g.maxTotal, g.scope, g.nonce
-                )
-            )
-        );
+    function sessionNonce(address user) external view returns (uint256) {
+        return _ss.nonce[user];
+    }
+
+    /// @notice Grants already submitted, by digest: a revoked session cannot be revived with its old grant.
+    function grantUsed(bytes32 digest) external view returns (bool) {
+        return _ss.grantUsed[digest];
     }
 
     /// @inheritdoc IFallpitRouter
-    function orderDigest(Order calldata o) public view returns (bytes32) {
-        return _typed(
-            keccak256(
-                abi.encode(
-                    ORDER_TYPEHASH,
-                    o.user,
-                    o.roundId,
-                    o.product,
-                    o.isBuy,
-                    o.shares,
-                    o.limit,
-                    o.deadline,
-                    o.nonce
-                )
-            )
-        );
+    function grantDigest(SessionGrant calldata g) external view returns (bytes32) {
+        return SessionLogic.grantDigest(g);
     }
 
     /// @inheritdoc IFallpitRouter
-    function vaultOpDigest(VaultOp calldata v) public view returns (bytes32) {
-        return _typed(
-            keccak256(
-                abi.encode(VAULT_OP_TYPEHASH, v.user, v.op, v.house, v.amount, v.minOut, v.deadline, v.nonce)
-            )
-        );
+    function orderDigest(Order calldata o) external view returns (bytes32) {
+        return SessionLogic.orderDigest(o);
     }
 
     /// @inheritdoc IFallpitRouter
-    function listOpDigest(ListOp calldata op) public view returns (bytes32) {
-        return
-            _typed(keccak256(abi.encode(LIST_OP_TYPEHASH, op.user, op.chip, op.seed, op.deadline, op.nonce)));
+    function vaultOpDigest(VaultOp calldata v) external view returns (bytes32) {
+        return SessionLogic.vaultOpDigest(v);
     }
 
     /// @inheritdoc IFallpitRouter
-    function cancelDigest(address user, uint256 nonce) public view returns (bytes32) {
-        return _typed(keccak256(abi.encode(CANCEL_TYPEHASH, user, nonce)));
+    function listOpDigest(ListOp calldata op) external view returns (bytes32) {
+        return SessionLogic.listOpDigest(op);
+    }
+
+    /// @inheritdoc IFallpitRouter
+    function cancelDigest(address user, uint256 nonce) external view returns (bytes32) {
+        return SessionLogic.cancelDigest(user, nonce);
     }
 
     // ------------------------------------------------------------------------------------- ETH pools
 
     /// @inheritdoc IFallpitRouter
     /// @dev Only pools with no hooks: a hook on the ETH pool could take each buy down to `minChips`. The
-    ///      book's owner is read through the hook, so the right follows the book's ownership.
+    ///      book's owner is read through the hook, so the right follows the book's ownership. In
+    ///      `SessionLogic.setEthPool`.
     function setEthPool(address chip, uint24 fee, int24 tickSpacing, address hooks) external {
-        if (msg.sender != deployer && !_isBookOwner(msg.sender)) revert OnlyDeployerOrOwner();
-        if (hooks != address(0)) revert PoolHasHooks();
-        _ethPools[chip] = EthPool({fee: fee, tickSpacing: tickSpacing, hooks: hooks});
-        emit EthPoolSet(chip, fee, tickSpacing, hooks);
+        SessionLogic.setEthPool(_ethPools, deployer, address(hook), chip, fee, tickSpacing, hooks);
     }
 
     /// @inheritdoc IFallpitRouter
@@ -783,20 +740,6 @@ contract FallpitRouter is IFallpitRouter, IUnlockCallback {
             tickSpacing: custom ? p.tickSpacing : ETH_POOL_TICK_SPACING,
             hooks: IHooks(custom ? p.hooks : address(0))
         });
-    }
-
-    /// @dev True when `account` is the owner of the hook's book (false while the hook is not set).
-    function _isBookOwner(address account) private view returns (bool) {
-        address hook_ = address(hook);
-        return hook_ != address(0) && account == IOwnerOf(IVaultOf(hook_).book()).owner();
-    }
-
-    /// @dev EIP-712 digest in this router's domain. The domain separator is computed each time (no
-    ///      immutables: solc 0.8.26 via-IR fails with a second immutable here).
-    function _typed(bytes32 structHash) private view returns (bytes32) {
-        bytes32 domain =
-            keccak256(abi.encode(DOMAIN_TYPEHASH, NAME_HASH, VERSION_HASH, block.chainid, address(this)));
-        return keccak256(abi.encodePacked(hex"1901", domain, structHash));
     }
 
     /// @notice The ETH swap of `commitWithEth`, inside the PoolManager's unlock.
@@ -820,36 +763,48 @@ contract FallpitRouter is IFallpitRouter, IUnlockCallback {
         IFallpitHook hook_ = hook;
         uint256 limit = c.limit;
         if (c.isBuy) {
+            address chip = _termsOf(c.id).chip;
             // a buy spends at most what reaches the hook: all of the escrow (a buy's escrow is its limit),
             // unless the chip started to tax its transfers after the commit (then the cost must fit in what
             // arrived)
-            uint256 before = c.chip.balanceOf(address(hook_));
-            c.chip.safeTransfer(address(hook_), limit);
-            limit = c.chip.balanceOf(address(hook_)) - before;
+            uint256 before = chip.balanceOf(address(hook_));
+            chip.safeTransfer(address(hook_), limit);
+            limit = chip.balanceOf(address(hook_)) - before;
         }
         (bytes32 roundId, uint8 product) = hook_.tokenRef(c.id);
-        chips = hook_.fill{value: msg.value}(
+        chips = _hookFill(hook_, roundId, product, c, limit, report);
+    }
+
+    /// @dev The hook's fill of commit `c` with the buy limit `limit`, forwarding the ETH sent.
+    function _hookFill(
+        IFallpitHook hook_,
+        bytes32 roundId,
+        uint8 product,
+        StoredCommit memory c,
+        uint256 limit,
+        bytes calldata report
+    ) private returns (uint256) {
+        return hook_.fill{value: msg.value}(
             roundId, product, c.isBuy, c.shares, limit, c.user, c.fillTs, report
         );
     }
 
     /// @inheritdoc IFallpitRouter
-    function getCommit(uint256 commitId) external view returns (Commit memory) {
+    function getCommit(uint256 commitId) external view returns (Commit memory m) {
         StoredCommit storage c = _commits[commitId];
-        return Commit({
-            user: c.user,
-            fillTs: c.fillTs,
-            status: c.status,
-            isBuy: c.isBuy,
-            id: c.id,
-            chip: c.chip,
-            fillFee: c.fillFee,
-            refundDelay: c.refundDelay,
-            shares: c.shares,
-            prev: c.prev,
-            limit: c.limit,
-            escrow: _escrowOf(c)
-        });
+        RoundTerms storage tm = _termsOf(c.id);
+        m.user = c.user;
+        m.fillTs = c.fillTs;
+        m.status = c.status;
+        m.isBuy = c.isBuy;
+        m.id = c.id;
+        m.chip = tm.chip;
+        m.fillFee = tm.fillFee;
+        m.refundDelay = tm.refundDelay;
+        m.shares = c.shares;
+        m.prev = uint96(_prevOf(c, commitId));
+        m.limit = c.limit;
+        m.escrow = _escrowOf(c);
     }
 
     /// @notice Total chip escrow of pending buy commits in `asset`; the router's balance always covers it.
@@ -883,6 +838,18 @@ contract FallpitRouter is IFallpitRouter, IUnlockCallback {
         ethLeft = ethIn - paid;
     }
 
+    /// @dev The commit before `c` (id `commitId`) that holds it, 0 for none.
+    function _prevOf(StoredCommit storage c, uint256 commitId) private view returns (uint256) {
+        uint256 gap = c.prevGap;
+        return gap == 0 ? 0 : commitId - gap;
+    }
+
+    /// @dev The terms of the round of ticket `id` (a ticket id is its round id with the product in the low
+    ///      byte).
+    function _termsOf(uint256 id) private view returns (RoundTerms storage) {
+        return _terms[bytes32(id & ~uint256(0xff))];
+    }
+
     /// @dev The escrow of a commit: a buy escrows its limit in chips, a sell its shares in tickets.
     function _escrowOf(StoredCommit storage c) private view returns (uint256) {
         return c.isBuy ? c.limit : c.shares;
@@ -900,14 +867,16 @@ contract FallpitRouter is IFallpitRouter, IUnlockCallback {
 
     /// @dev Takes a commit's escrow off the totals (the fill or the refund then moves it). The stored total
     ///      is the pending escrow plus 1, so it stays at 1 or above.
-    function _release(StoredCommit storage c, uint256 escrow) private {
-        if (c.isBuy) _escrowed[c.chip] -= escrow;
+    function _release(StoredCommit storage c, RoundTerms storage tm, uint256 escrow) private {
+        if (c.isBuy) _escrowed[tm.chip] -= escrow;
         else _escrowedTickets[c.id] -= escrow;
     }
 
     /// @dev Sends a refunded commit's escrow back to its user.
-    function _returnEscrow(StoredCommit storage c, address user, uint256 escrow) private {
-        if (c.isBuy) c.chip.safeTransfer(user, escrow);
+    function _returnEscrow(StoredCommit storage c, RoundTerms storage tm, address user, uint256 escrow)
+        private
+    {
+        if (c.isBuy) tm.chip.safeTransfer(user, escrow);
         else IERC6909Balance(address(hook)).transfer(user, c.id, escrow);
     }
 
@@ -935,9 +904,8 @@ contract FallpitRouter is IFallpitRouter, IUnlockCallback {
         assembly ("memory-safe") {
             code := mload(add(err, 0x24))
         }
-        if (code < uint256(RefundReason.Limit) || code > uint256(RefundReason.ProductCap)) {
-            return RefundReason.None;
-        }
+        // code 0 is None itself
+        if (code > uint256(RefundReason.ProductCap)) return RefundReason.None;
         return RefundReason(code);
     }
 

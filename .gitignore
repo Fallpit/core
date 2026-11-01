@@ -1,8 +1,6 @@
 out/
 cache/
+out-ir/
+cache-ir/
 broadcast/
-.env*
 !.env.example
-deployments/*.dry-run.json
-deployments/.test-*
-.DS_Store

@@ -211,6 +211,22 @@ contract VaultSessionsTest is IntegrationFixture {
         router.revokeSession(sessionKey);
         _relayReverts(o, _sig(sessionPk, router.vaultOpDigest(o)), IFallpitRouter.NoSession.selector);
 
+        // a revoked key cannot be granted again at the same session nonce
+        IFallpitRouter.SessionGrant memory g = IFallpitRouter.SessionGrant({
+            user: sam,
+            key: sessionKey,
+            expiry: clock + 1 days,
+            maxPerOrder: CAP,
+            maxTotal: 0,
+            scope: 3,
+            nonce: router.sessionNonce(sam)
+        });
+        bytes memory gsig = _sig(samKey, router.grantDigest(g));
+        vm.expectRevert(IFallpitRouter.StaleNonce.selector);
+        router.grantSession(g, gsig);
+        vm.prank(sam);
+        router.bumpSessionNonce();
+
         _grant(clock + 1 days, CAP);
         vm.prank(sam);
         router.bumpSessionNonce();

@@ -4,18 +4,34 @@ out = "out"
 libs = ["lib"]
 solc = "0.8.26"
 evm_version = "cancun"
-via_ir = true
+via_ir = false
 optimizer = true
 optimizer_runs = 200
 bytecode_hash = "none"
 # 2^32: the reference-vector and solve-count suites loop over many fills, each with 3 CDF nodes per edge
 gas_limit = 4294967296
 ffi = false
+# forge script links RoundLogic, PitBookRules, PitBookLogic and SessionLogic through the deterministic deployment proxy with this salt,
+# so their addresses follow from their code (`FallpitDeployer._deployLibraries` checks and records them)
+create2_library_salt = "0x0000000000000000000000000000000000000000000000000000000000000000"
+# LadderMath is the fill's hot path (about 60% of a fill's gas) and has room under the size limit: it builds
+# with many optimizer runs, everything else with 200. A file that imports LadderMath builds what it imports
+# with those runs too, so nothing imports it next to the other contracts: the deployer and the system
+# tests deploy it from its artifact (`FallpitDeployer._deployMath`, `deployCode`).
+additional_compiler_profiles = [{ name = "math", optimizer_runs = 10000 }]
+compilation_restrictions = [{ paths = "src/LadderMath.sol", min_optimizer_runs = 10000 }]
 fs_permissions = [
     { access = "read", path = "./test/vectors" },
     # the deployment record (script/DeployTestnet.s.sol)
     { access = "read-write", path = "./deployments" },
 ]
+
+# The via-IR pipeline, for comparison: `FOUNDRY_PROFILE=ir forge build`. A clean build takes about twenty
+# minutes and much memory; the default pipeline builds in about a minute.
+[profile.ir]
+via_ir = true
+out = "out-ir"
+cache_path = "cache-ir"
 
 [fuzz]
 runs = 256

@@ -77,7 +77,7 @@ import {ChipGuard} from "../src/ChipGuard.sol";
 ///      signer's (the script enforces distinct addresses) and tell users that testnet prices are signed
 ///      by the operator.
 ///
-///      Not configured here: the round parameters (fill fee 0.0001 ETH, loss limit 30%, fees, no product
+///      Not configured here: the round parameters (fill fee 0.000025 ETH, loss limit 30%, fees, no product
 ///      cap) and the menu of products every round opens with (eight floors of the close and the HIGHER /
 ///      LOWER pair, a minimum price of 0.02 chips a ticket) are the PitBook's built-in defaults, and the
 ///      keeper band (60 bps) and the close lag (300 s) are the PitOracle's. The owner can change them
@@ -346,12 +346,18 @@ contract DeployTestnet is Script, FallpitDeployer {
         // TRUSTLESS_TICKERS (optional) prices the named tickers by Pyth only, whatever the policy below says:
         // the local e2e uses it for ETH, whose fake Hermes answers for every feed.
         string[] memory trustless = vm.envOr("TRUSTLESS_TICKERS", ",", new string[](0));
+        // KEEPER_CLOSES=true (optional) drops the Pyth feed id of every KeeperOnly ticker, as the mainnet
+        // launch does: a ticker with a feed id closes on Pyth only, which a key without entitlement cannot read
+        bool keeperCloses = vm.envOr("KEEPER_CLOSES", false);
         for (uint256 i; i < names.length; ++i) {
             cfg.tickers[i] = tickerSetup(names[i]);
             for (uint256 j; j < trustless.length; ++j) {
                 if (keccak256(bytes(trustless[j])) == keccak256(bytes(names[i]))) {
                     cfg.tickers[i].fillSource = IPitBook.FillSource.TrustlessOnly;
                 }
+            }
+            if (keeperCloses && cfg.tickers[i].fillSource == IPitBook.FillSource.KeeperOnly) {
+                cfg.tickers[i].pythFeedId = bytes32(0);
             }
         }
 
@@ -417,63 +423,77 @@ contract DeployTestnet is Script, FallpitDeployer {
     {
         Core memory c = s.core;
         string memory contracts = string.concat(
-            _entry("LadderMath", address(c.math), head, false),
-            _entry("PitOracle", address(c.oracle), head, false),
-            _entry("ChipGuard", address(c.guard), head, false),
-            _entry("PitVault", address(c.vault), head, false),
-            _entry("PitBook", address(c.book), head, false),
-            _entry("FallpitRouter", address(c.router), head, false),
-            _entry("FallpitHook", address(c.hook), head, false),
-            _entry("FallpitLens", address(c.lens), head, false),
-            _entry("FallpitDirectory", address(c.directory), head, false),
-            _entry("CommunityTreasury", address(c.treasury), head, false),
-            _entry("AnchorRegistry", address(c.registry), head, false),
-            _entry("PitLister", address(c.lister), head, false),
-            _entry("VaultFeeForwarderFactory", address(c.forwarders), head, true)
+            string.concat(
+                _entry("LadderMath", address(c.math), head, false),
+                _entry("PitOracle", address(c.oracle), head, false),
+                _entry("ChipGuard", address(c.guard), head, false),
+                _entry("PitVault", address(c.vault), head, false)
+            ),
+            string.concat(
+                _entry("PitBook", address(c.book), head, false),
+                _entry("FallpitRouter", address(c.router), head, false)
+            )
+        );
+        contracts = string.concat(
+            string.concat(
+                contracts,
+                _entry("FallpitHook", address(c.hook), head, false),
+                _entry("FallpitLens", address(c.lens), head, false),
+                _entry("FallpitDirectory", address(c.directory), head, false)
+            ),
+            string.concat(
+                _entry("CommunityTreasury", address(c.treasury), head, false),
+                _entry("AnchorRegistry", address(c.registry), head, false),
+                _entry("PitLister", address(c.lister), head, false),
+                _entry("VaultFeeForwarderFactory", address(c.forwarders), head, true)
+            )
         );
         string memory signers;
         for (uint256 i; i < cfg.signers.length; ++i) {
             signers = string.concat(signers, i == 0 ? "" : ",", _q(vm.toString(cfg.signers[i])));
         }
         string memory roles = string.concat(
-            '{"owner":',
-            _q(vm.toString(cfg.owner)),
-            ',"guardian":',
-            _q(vm.toString(cfg.guardian)),
-            ',"volKeeper":',
-            _q(vm.toString(cfg.volKeeper)),
-            ',"feeRecipient":',
-            _q(vm.toString(cfg.feeRecipient)),
-            ',"mirrorPusher":',
-            _q(vm.toString(cfg.mirrorPusher)),
-            ',"keeperSigners":[',
-            signers,
-            '],"keeperThreshold":',
-            vm.toString(cfg.threshold),
-            "}"
+            string.concat(
+                '{"owner":', _q(vm.toString(cfg.owner)), ',"guardian":', _q(vm.toString(cfg.guardian))
+            ),
+            string.concat(
+                ',"volKeeper":',
+                _q(vm.toString(cfg.volKeeper)),
+                ',"feeRecipient":',
+                _q(vm.toString(cfg.feeRecipient))
+            ),
+            string.concat(
+                ',"mirrorPusher":', _q(vm.toString(cfg.mirrorPusher)), ',"keeperSigners":[', signers
+            ),
+            string.concat('],"keeperThreshold":', vm.toString(cfg.threshold), "}")
         );
         return string.concat(
-            '{"schema":1,"chainId":',
-            vm.toString(block.chainid),
-            ',"deployedAt":',
-            vm.toString(at),
-            ',"deployer":',
-            _q(vm.toString(deployer)),
-            ',"roles":',
-            roles,
-            ',"external":{"poolManager":',
-            _q(vm.toString(cfg.poolManager)),
-            ',"pyth":',
-            _q(vm.toString(cfg.pyth)),
-            '},"contracts":{',
-            contracts,
-            '},"chips":[',
-            _chipsJson(cfg, s, head),
-            '],"tickers":[',
-            _tickersJson(cfg, s, head, at + s.core.book.OWNER_DELAY()),
-            '],"housesFrom":',
-            vm.toString(at + s.core.book.OWNER_DELAY()),
-            ',"housesBlock":0,"houses":[]}'
+            string.concat(
+                string.concat(
+                    '{"schema":1,"chainId":', vm.toString(block.chainid), ',"deployedAt":', vm.toString(at)
+                ),
+                string.concat(',"deployer":', _q(vm.toString(deployer)), ',"roles":', roles),
+                string.concat(
+                    ',"external":{"poolManager":',
+                    _q(vm.toString(cfg.poolManager)),
+                    ',"pyth":',
+                    _q(vm.toString(cfg.pyth))
+                ),
+                string.concat(
+                    string.concat('},"contracts":{', contracts, '},"libraries":{', _librariesJson()),
+                    '},"chips":[',
+                    _chipsJson(cfg, s, head)
+                )
+            ),
+            string.concat(
+                string.concat(
+                    '],"tickers":[',
+                    _tickersJson(cfg, s, head, at + s.core.book.OWNER_DELAY()),
+                    '],"housesFrom":',
+                    vm.toString(at + s.core.book.OWNER_DELAY())
+                ),
+                ',"housesBlock":0,"houses":[]}'
+            )
         );
     }
 
@@ -487,21 +507,20 @@ contract DeployTestnet is Script, FallpitDeployer {
         for (uint256 i; i < houses.length; ++i) {
             PitVault.House memory h = vault.getHouse(houses[i]);
             json = string.concat(
-                json,
-                i == 0 ? "{" : ",{",
-                '"id":',
-                _q(vm.toString(houses[i])),
-                ',"ticker":',
-                _q(LibString.fromSmallString(h.ticker)),
-                ',"tickerId":',
-                _q(vm.toString(h.ticker)),
-                ',"chip":',
-                _q(vm.toString(h.chip)),
-                ',"chipSymbol":',
-                LibString.escapeJSON(FaucetCoin(h.chip).symbol(), true),
-                ',"createdBlock":',
-                vm.toString(head),
-                "}"
+                string.concat(json, i == 0 ? "{" : ",{", '"id":', _q(vm.toString(houses[i]))),
+                string.concat(
+                    ',"ticker":',
+                    _q(LibString.fromSmallString(h.ticker)),
+                    ',"tickerId":',
+                    _q(vm.toString(h.ticker))
+                ),
+                string.concat(
+                    ',"chip":',
+                    _q(vm.toString(h.chip)),
+                    ',"chipSymbol":',
+                    LibString.escapeJSON(FaucetCoin(h.chip).symbol(), true)
+                ),
+                string.concat(',"createdBlock":', vm.toString(head), "}")
             );
         }
         json = string.concat(json, "]");
@@ -522,18 +541,19 @@ contract DeployTestnet is Script, FallpitDeployer {
     {
         for (uint256 i; i < s.chips.length; ++i) {
             json = string.concat(
-                json,
-                i == 0 ? "{" : ",{",
-                '"address":',
-                _q(vm.toString(address(s.chips[i]))),
-                ',"symbol":',
-                LibString.escapeJSON(cfg.chipSymbols[i], true),
-                ',"name":',
-                LibString.escapeJSON(cfg.chipNames[i], true),
-                ',"decimals":',
-                vm.toString(uint256(s.chips[i].decimals())),
-                ',"deployBlock":',
-                vm.toString(head),
+                string.concat(json, i == 0 ? "{" : ",{", '"address":', _q(vm.toString(address(s.chips[i])))),
+                string.concat(
+                    ',"symbol":',
+                    LibString.escapeJSON(cfg.chipSymbols[i], true),
+                    ',"name":',
+                    LibString.escapeJSON(cfg.chipNames[i], true)
+                ),
+                string.concat(
+                    ',"decimals":',
+                    vm.toString(uint256(s.chips[i].decimals())),
+                    ',"deployBlock":',
+                    vm.toString(head)
+                ),
                 "}"
             );
         }
@@ -550,30 +570,36 @@ contract DeployTestnet is Script, FallpitDeployer {
             IPitBook.Reseed memory r = s.core.book.pendingReseed(t.ticker);
             if (r.eta == 0) r.windows = s.core.book.getTicker(t.ticker).windows;
             json = string.concat(
-                json,
-                i == 0 ? "{" : ",{",
-                '"symbol":',
-                _q(LibString.fromSmallString(t.ticker)),
-                ',"id":',
-                _q(vm.toString(t.ticker)),
-                ',"clock":',
-                _q(t.clock == IPitBook.Clock.EveryDay ? "EveryDay" : "NYWeekdays"),
-                ',"fillSource":',
-                _q(t.fillSource == IPitBook.FillSource.TrustlessOnly ? "TrustlessOnly" : "KeeperOnly"),
                 string.concat(
-                    ',"windows":',
-                    vm.toString(uint256(r.windows)),
-                    ',"pythFeedId":',
-                    _q(vm.toString(t.pythFeedId)),
-                    ',"mirrorFeed":',
-                    _q(vm.toString(address(s.feeds[i]))),
-                    ',"stockToken":',
-                    _q(vm.toString(address(s.stockTokens[i]))),
-                    ',"registeredBlock":',
-                    vm.toString(head),
-                    ',"inForceAt":',
-                    vm.toString(inForceAt),
-                    "}"
+                    json, i == 0 ? "{" : ",{", '"symbol":', _q(LibString.fromSmallString(t.ticker))
+                ),
+                string.concat(
+                        ',"id":',
+                        _q(vm.toString(t.ticker)),
+                        ',"clock":',
+                        _q(t.clock == IPitBook.Clock.EveryDay ? "EveryDay" : "NYWeekdays")
+                    ),
+                string.concat(
+                    ',"fillSource":',
+                    _q(t.fillSource == IPitBook.FillSource.TrustlessOnly ? "TrustlessOnly" : "KeeperOnly"),
+                    string.concat(
+                        string.concat(
+                            ',"windows":',
+                            vm.toString(uint256(r.windows)),
+                            ',"pythFeedId":',
+                            _q(vm.toString(t.pythFeedId))
+                        ),
+                        string.concat(
+                            ',"mirrorFeed":',
+                            _q(vm.toString(address(s.feeds[i]))),
+                            ',"stockToken":',
+                            _q(vm.toString(address(s.stockTokens[i])))
+                        ),
+                        string.concat(
+                            ',"registeredBlock":', vm.toString(head), ',"inForceAt":', vm.toString(inForceAt)
+                        ),
+                        "}"
+                    )
                 )
             );
         }
@@ -585,12 +611,8 @@ contract DeployTestnet is Script, FallpitDeployer {
         returns (string memory)
     {
         return string.concat(
-            _q(name),
-            ':{"address":',
-            _q(vm.toString(at)),
-            ',"deployBlock":',
-            vm.toString(head),
-            last ? "}" : "},"
+            string.concat(_q(name), ':{"address":', _q(vm.toString(at)), ',"deployBlock":'),
+            string.concat(vm.toString(head), last ? "}" : "},")
         );
     }
 

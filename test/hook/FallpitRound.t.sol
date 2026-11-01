@@ -70,21 +70,25 @@ contract FallpitRoundTest is HookFixture {
         assertEq(c.params.menu, Menus.standard(), "the book's default menu, frozen in the round");
         assertEq(c.params.menu, book.DEFAULT_MENU());
 
-        IFallpitHook.RoundState memory st = hook.getState(id);
-        assertEq(uint8(st.status), uint8(IFallpitHook.Status.Open));
-        assertEq(st.g, 1e18);
-        assertEq(st.held, HOUSE_CAPITAL);
+        {
+            IFallpitHook.RoundState memory st = hook.getState(id);
+            assertEq(uint8(st.status), uint8(IFallpitHook.Status.Open));
+            assertEq(st.g, 1e18);
+            assertEq(st.held, HOUSE_CAPITAL);
+        }
 
         // capital moved from the vault into the hook
         assertTrue(vault.isLocked(house));
         assertEq(chip.balanceOf(address(vault)), 0);
-        (uint256 claims, uint256 owed) = Accounting.read(address(hook), address(chip));
-        assertEq(claims, HOUSE_CAPITAL);
-        assertEq(owed, HOUSE_CAPITAL);
+        {
+            (uint256 claims, uint256 owed) = Accounting.read(address(hook), address(chip));
+            assertEq(claims, HOUSE_CAPITAL);
+            assertEq(owed, HOUSE_CAPITAL);
+        }
         assertEq(chip.balanceOf(address(pm)), 0, "nothing in the PoolManager");
 
         // one ticket id per product of the menu: the round id and the index, nothing deployed
-        Ticket[12] memory tokens = ticketsOf(hook, id);
+        Ticket[15] memory tokens = ticketsOf(hook, id);
         uint8[2][10] memory runs = [
             [0, 11], [12, 15], [16, 17], [18, 19], [20, 21], [22, 23], [24, 27], [28, 39], [0, 19], [20, 39]
         ];
@@ -97,23 +101,27 @@ contract FallpitRoundTest is HookFixture {
             assertEq(lo, runs[i][0]);
             assertEq(hi, runs[i][1]);
             // the price range: the edges of the run, S0 * exp(edge), open at the ends of the ladder
-            (uint256 low, uint256 high) = PitMath.bounds(S0, c.sigma, lo, hi);
-            assertEq(
-                low,
-                runs[i][0] == 0
-                    ? 0
-                    : S0 * uint256(FixedPointMathLib.expWad(math.edge(c.sigma, runs[i][0] - 1))) / 1e18
-            );
-            assertEq(
-                high,
-                runs[i][1] == 39
-                    ? type(uint256).max
-                    : S0 * uint256(FixedPointMathLib.expWad(math.edge(c.sigma, runs[i][1]))) / 1e18
-            );
+            {
+                (uint256 low, uint256 high) = PitMath.bounds(S0, c.sigma, lo, hi);
+                assertEq(
+                    low,
+                    runs[i][0] == 0
+                        ? 0
+                        : S0 * uint256(FixedPointMathLib.expWad(math.edge(c.sigma, runs[i][0] - 1))) / 1e18
+                );
+                assertEq(
+                    high,
+                    runs[i][1] == 39
+                        ? type(uint256).max
+                        : S0 * uint256(FixedPointMathLib.expWad(math.edge(c.sigma, runs[i][1]))) / 1e18
+                );
+            }
             assertEq(token.totalSupply(), 0);
-            (bytes32 ref, uint8 index) = hook.tokenRef(token.id);
-            assertEq(ref, id);
-            assertEq(index, i);
+            {
+                (bytes32 ref, uint8 index) = hook.tokenRef(token.id);
+                assertEq(ref, id);
+                assertEq(index, i);
+            }
         }
         assertEq(tokens[10].id, 0, "nothing above the menu");
         assertEq(tokens[11].id, 0);
@@ -223,7 +231,7 @@ contract FallpitRoundTest is HookFixture {
         _assertSupplies();
         _assertHookSolvent(address(chip));
 
-        (uint256[12] memory supply,) = hook.getSupplies(roundId);
+        (uint256[15] memory supply,) = hook.getSupplies(roundId);
         IFallpitHook.RoundState memory open = _state();
         assertGt(open.protocolFees, 0);
         assertEq(chip.balanceOf(address(hook)), open.held, "every chip of the round sits in the hook");

@@ -24,6 +24,11 @@ contract AttacksSystemTest is AttackBase {
     // reentrancy through a malicious chip
     // --------------------------------------------------------------------------------------------
 
+    /// @dev The hook's own `fill` of a HIGHER buy, as a chip posing as the router would call it.
+    function _hookFillCall(address user, uint64 t, bytes memory report) internal view returns (bytes memory) {
+        return abi.encodeCall(hook.fill, (roundId, HIGHER, true, 5_000e18, 100_000e18, user, t, report));
+    }
+
     function test_attack_reentrantChip_everyEntryPointIsBlocked() public {
         ReentrantChip evil = new ReentrantChip();
         vm.prank(owner);
@@ -49,28 +54,27 @@ contract AttacksSystemTest is AttackBase {
 
         // commit: while the escrow moves user -> router the chip tries to commit and to fill
         evil.arm(address(router), abi.encodeCall(router.commit, (roundId, HIGHER, true, 1e18, 1e18)));
-        uint256 id1 = _commitBuy(alice, HIGHER, 5_000e18, 100_000e18);
-        attempts = _assertBlocked(evil, attempts, IFallpitRouter.Reentrancy.selector);
-        evil.disarm();
-        uint256 id2 = _commitBuy(bob, HIGHER, 5_000e18, 100_000e18);
-        uint64 t = router.getCommit(id1).fillTs;
-        _warp(t);
-        bytes memory report = _print(t, S0);
+        {
+            uint256 id1 = _commitBuy(alice, HIGHER, 5_000e18, 100_000e18);
+            attempts = _assertBlocked(evil, attempts, IFallpitRouter.Reentrancy.selector);
+            evil.disarm();
+            uint256 id2 = _commitBuy(bob, HIGHER, 5_000e18, 100_000e18);
+            uint64 t = router.getCommit(id1).fillTs;
+            _warp(t);
+            bytes memory report = _print(t, S0);
 
-        // fill: while the cost moves router -> hook the chip tries to fill the other commit ...
-        evil.arm(address(router), abi.encodeCall(router.fill, (id2, report)));
-        vm.prank(keeper);
-        assertTrue(router.fill(id1, report));
-        attempts = _assertBlocked(evil, attempts, IFallpitRouter.Reentrancy.selector);
-        // ... and to call the hook's fill itself while the escrow moves to the hook, posing as the router
-        // (only the router may fill)
-        evil.arm(
-            address(hook),
-            abi.encodeCall(hook.fill, (roundId, HIGHER, true, 5_000e18, 100_000e18, address(evil), t, report))
-        );
-        vm.prank(keeper);
-        assertTrue(router.fill(id2, report));
-        attempts = _assertBlocked(evil, attempts, IFallpitHook.OnlyRouter.selector);
+            // fill: while the cost moves router -> hook the chip tries to fill the other commit ...
+            evil.arm(address(router), abi.encodeCall(router.fill, (id2, report)));
+            vm.prank(keeper);
+            assertTrue(router.fill(id1, report));
+            attempts = _assertBlocked(evil, attempts, IFallpitRouter.Reentrancy.selector);
+            // ... and to call the hook's fill itself while the escrow moves to the hook, posing as the router
+            // (only the router may fill)
+            evil.arm(address(hook), _hookFillCall(address(evil), t, report));
+            vm.prank(keeper);
+            assertTrue(router.fill(id2, report));
+            attempts = _assertBlocked(evil, attempts, IFallpitHook.OnlyRouter.selector);
+        }
         assertEq(_token(HIGHER).totalSupply(), 10_000e18, "exactly the two fills minted");
 
         // sell: while the proceeds move hook -> user the chip tries to refund a pending commit
@@ -78,15 +82,17 @@ contract AttacksSystemTest is AttackBase {
         Ticket memory token = _token(HIGHER);
         vm.startPrank(alice);
         token.approve(address(router), 2_000e18);
-        uint256 id4 = router.commit{value: FILL_FEE}(roundId, HIGHER, false, 2_000e18, 0);
-        vm.stopPrank();
-        uint256 id3 = _commitBuy(bob, LOWER, 1_000e18, 10_000e18);
-        evil.arm(address(router), abi.encodeCall(router.refund, (id3)));
-        attempts = evil.attempts(); // the commit of a sell moves no chips
-        assertTrue(_fill(id4, S0));
-        attempts = _assertBlocked(evil, attempts, IFallpitRouter.Reentrancy.selector);
-        evil.disarm();
-        assertTrue(_fill(id3, S0));
+        {
+            uint256 id4 = router.commit{value: FILL_FEE}(roundId, HIGHER, false, 2_000e18, 0);
+            vm.stopPrank();
+            uint256 id3 = _commitBuy(bob, LOWER, 1_000e18, 10_000e18);
+            evil.arm(address(router), abi.encodeCall(router.refund, (id3)));
+            attempts = evil.attempts(); // the commit of a sell moves no chips
+            assertTrue(_fill(id4, S0));
+            attempts = _assertBlocked(evil, attempts, IFallpitRouter.Reentrancy.selector);
+            evil.disarm();
+            assertTrue(_fill(id3, S0));
+        }
         _assertSupplies();
         _assertHookSolvent(address(evil));
 
@@ -103,20 +109,21 @@ contract AttacksSystemTest is AttackBase {
         // finalize: while the house's share moves hook -> vault the chip tries to finalize again,
         _recordClose(S0 * 101 / 100, PYTH_SOURCE);
         hook.settleRound(house, day);
-        evil.arm(address(hook), abi.encodeCall(hook.finalizeRound, (house, day)));
-        uint256 snapshot = vm.snapshotState();
-        hook.finalizeRound(house, day);
-        attempts = _assertBlocked(evil, attempts, IFallpitHook.Reentrancy.selector);
-        uint256 honestBack = vault.getHouse(house).lpAssets;
-        vm.revertToState(snapshot);
-        attempts = evil.attempts();
-        // ... or to process the vault's queues before the round's result is booked (the house is locked)
-        evil.arm(address(vault), abi.encodeCall(vault.processQueues, (house)));
-        hook.finalizeRound(house, day);
-        attempts = _assertBlocked(evil, attempts, PitVault.HouseLocked.selector);
-        assertEq(vault.getHouse(house).lpAssets, honestBack, "the result is booked the same either way");
-        assertEq(vault.getHouse(house).pendingDeposits, 10_000e18, "the queued deposit is untouched");
-
+        {
+            evil.arm(address(hook), abi.encodeCall(hook.finalizeRound, (house, day)));
+            uint256 snapshot = vm.snapshotState();
+            hook.finalizeRound(house, day);
+            attempts = _assertBlocked(evil, attempts, IFallpitHook.Reentrancy.selector);
+            uint256 honestBack = vault.getHouse(house).lpAssets;
+            vm.revertToState(snapshot);
+            attempts = evil.attempts();
+            // ... or to process the vault's queues before the round's result is booked (the house is locked)
+            evil.arm(address(vault), abi.encodeCall(vault.processQueues, (house)));
+            hook.finalizeRound(house, day);
+            attempts = _assertBlocked(evil, attempts, PitVault.HouseLocked.selector);
+            assertEq(vault.getHouse(house).lpAssets, honestBack, "the result is booked the same either way");
+            assertEq(vault.getHouse(house).pendingDeposits, 10_000e18, "the queued deposit is untouched");
+        }
         // redeem: while the payout moves hook -> holder the chip, itself a holder of winning
         // tokens, tries to redeem inside the redeem
         vm.prank(alice);
@@ -127,15 +134,19 @@ contract AttacksSystemTest is AttackBase {
         attempts = _assertBlocked(evil, attempts, IFallpitHook.Reentrancy.selector);
         // collecting fees: the chip tries to collect them again
         evil.arm(address(hook), abi.encodeCall(hook.collectProtocolFees, (address(evil))));
-        uint256 fees = hook.collectProtocolFees(address(evil));
-        attempts = _assertBlocked(evil, attempts, IFallpitHook.Reentrancy.selector);
-        assertEq(evil.balanceOf(feeRecipient), fees);
+        {
+            uint256 fees = hook.collectProtocolFees(address(evil));
+            attempts = _assertBlocked(evil, attempts, IFallpitHook.Reentrancy.selector);
+            assertEq(evil.balanceOf(feeRecipient), fees);
+        }
         // an LP withdrawal: while the chips move vault -> LP the chip tries to withdraw again
-        uint256 lpShares = vault.balanceOf(lp, uint256(house));
-        evil.arm(address(vault), abi.encodeCall(vault.requestWithdraw, (house, lpShares / 2)));
-        vm.prank(lp);
-        vault.requestWithdraw(house, lpShares / 2);
-        attempts = _assertBlocked(evil, attempts, bytes4(keccak256("Reentrancy()")));
+        {
+            uint256 lpShares = vault.balanceOf(lp, uint256(house));
+            evil.arm(address(vault), abi.encodeCall(vault.requestWithdraw, (house, lpShares / 2)));
+            vm.prank(lp);
+            vault.requestWithdraw(house, lpShares / 2);
+            attempts = _assertBlocked(evil, attempts, bytes4(keccak256("Reentrancy()")));
+        }
         evil.disarm();
 
         assertEq(evil.successes(), 0, "no reentrant call ever got through");
@@ -168,7 +179,7 @@ contract AttacksSystemTest is AttackBase {
         _open();
         uint256 cost = _eveBuy(HIGHER, 10_000e18, S0);
         uint256 proceeds = _eveSell(HIGHER, 6_000e18, S0);
-        (, uint256[12] memory premium) = hook.getSupplies(roundId);
+        (, uint256[15] memory premium) = hook.getSupplies(roundId);
         assertLe(premium[HIGHER], cost * 4_000 / 10_000, "the sold shares took their average cost with them");
         _warp(NYTime.closeTs(day) + 24 hours + 1);
         hook.voidRound(house, day);
@@ -200,7 +211,7 @@ contract AttacksSystemTest is AttackBase {
         for (uint256 i; i < 6; ++i) {
             paid += _eveBuy(HIGHER, 400_000e18, S0);
             got += _eveSell(HIGHER, 400_000e18, S0);
-            (, uint256[12] memory basis) = hook.getSupplies(roundId);
+            (, uint256[15] memory basis) = hook.getSupplies(roundId);
             assertLe(
                 basis[HIGHER], paid - got, "the cost basis never exceeds the net cash paid for the token"
             );
@@ -300,7 +311,7 @@ contract AttacksSystemTest is AttackBase {
         }
         assertGt(chip.balanceOf(address(x)), 3_000_000e18 + 500_000e18, "x took chips out of the round");
 
-        (uint256[12] memory supply, uint256[12] memory premium) = hook.getSupplies(roundId);
+        (uint256[15] memory supply, uint256[15] memory premium) = hook.getSupplies(roundId);
         IFallpitHook.RoundState memory st = _state();
         uint256 costBasis = premium[0] + premium[1] + premium[4];
         emit log_named_decimal_uint("holders' cost basis", costBasis, 18);
@@ -349,7 +360,7 @@ contract AttacksSystemTest is AttackBase {
         for (uint256 i; i < 5; ++i) {
             got += _eveSell(HIGHER, 20_000e18, up);
         }
-        (, uint256[12] memory premium) = hook.getSupplies(roundId);
+        (, uint256[15] memory premium) = hook.getSupplies(roundId);
         assertGt(
             got + premium[LOWER], paid, "under a full-refund rule the sale plus the refund beat her outlay"
         );
@@ -548,9 +559,11 @@ contract AttacksSystemTest is AttackBase {
         assertTrue(a.fill(id, _printFor(id, S0)));
         assertEq(_state().held, c.capital + quoted, "the hook books exactly the cost it received");
         assertGe(taxChip.balanceOf(address(hook)), c.capital + quoted);
-        uint256 sent = 50_000e18 - taxChip.balanceOf(address(a));
-        assertGt(sent, quoted * 100 / 99, "the user bears the chip's tax on the way in");
-        assertLt(sent, quoted * 104 / 100);
+        {
+            uint256 sent = 50_000e18 - taxChip.balanceOf(address(a));
+            assertGt(sent, quoted * 100 / 99, "the user bears the chip's tax on the way in");
+            assertLt(sent, quoted * 104 / 100);
+        }
         assertEq(taxChip.balanceOf(address(router)), 0, "unused escrow went back");
         _assertHookSolvent(address(taxChip));
 
@@ -565,19 +578,24 @@ contract AttacksSystemTest is AttackBase {
         // sell: the escrow is tickets, so the commit is exact; proceeds arrive net of the tax
         a.approve(_token(HIGHER).id, address(router));
         uint256 before = taxChip.balanceOf(address(a));
-        (uint256 net,,,,,) = lens.quote(roundId, HIGHER, false, 4_000e18, S0, clock + 2);
-        id = a.commit(roundId, HIGHER, false, 4_000e18, 0);
-        assertTrue(a.fill(id, _printFor(id, S0)));
-        assertEq(taxChip.balanceOf(address(a)) - before, net - net / 100);
+        {
+            (uint256 net,,,,,) = lens.quote(roundId, HIGHER, false, 4_000e18, S0, clock + 2);
+            id = a.commit(roundId, HIGHER, false, 4_000e18, 0);
+            assertTrue(a.fill(id, _printFor(id, S0)));
+            assertEq(taxChip.balanceOf(address(a)) - before, net - net / 100);
+        }
         _assertSupplies();
         _assertHookSolvent(address(taxChip));
 
         // settle, finalize, redeem: every outflow is the nominal amount, the receiver bears the tax
         _recordClose(S0 * 101 / 100, PYTH_SOURCE);
         hook.settleRound(house, day);
-        IFallpitHook.RoundState memory st = _state();
-        hook.finalizeRound(house, day);
-        uint256 back = st.held - st.payoutOwed - st.protocolFees;
+        uint256 back;
+        {
+            IFallpitHook.RoundState memory st = _state();
+            hook.finalizeRound(house, day);
+            back = st.held - st.payoutOwed - st.protocolFees;
+        }
         assertEq(taxChip.balanceOf(address(vault)), back - back / 100);
         assertEq(vault.roundCapital(house), back - back / 100);
         before = taxChip.balanceOf(address(a));
@@ -585,9 +603,11 @@ contract AttacksSystemTest is AttackBase {
         assertEq(taxChip.balanceOf(address(a)) - before, 5_940e18);
         hook.collectProtocolFees(address(taxChip));
 
-        (uint256 claims, uint256 owed) = Accounting.read(address(hook), address(taxChip));
-        assertEq(claims, 0);
-        assertEq(owed, 0);
+        {
+            (uint256 claims, uint256 owed) = Accounting.read(address(hook), address(taxChip));
+            assertEq(claims, 0);
+            assertEq(owed, 0);
+        }
         assertLe(taxChip.balanceOf(address(hook)), 4, "only gross-up dust is left in the hook");
         _assertVaultBacked(address(taxChip));
         // nothing was created: every chip minted is somewhere or was burned as tax

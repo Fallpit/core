@@ -141,7 +141,7 @@ abstract contract LadderMathBase is Test {
             (uint8 lo, uint8 hi) = _set(sub, 4);
             int256 delta = int256(_size(sub, 5, s.capital));
             if (_rand(sub, 6) % 3 == 0) delta = -delta;
-            s.v = math.fill(s.v, s.b0, s.sigma, _ctx(s.x, s.sd, s.g, gNew), lo, hi, delta).v;
+            s.v = _fill(s, gNew, lo, hi, delta).v;
             s.g = gNew;
         }
     }
@@ -159,5 +159,14 @@ abstract contract LadderMathBase is Test {
         returns (ILadderMath.Fill memory)
     {
         return math.fill(s.v, s.b0, s.sigma, _ctx(s.x, s.sd, s.g, gNew), lo, hi, delta);
+    }
+
+    /// @dev `_fill` from the state `v` instead of the scenario's, at the scenario's depth scale.
+    function _fillFrom(int256[40] memory v, Scn memory s, uint8 lo, uint8 hi, int256 delta)
+        internal
+        view
+        returns (ILadderMath.Fill memory)
+    {
+        return math.fill(v, s.b0, s.sigma, _ctx(s.x, s.sd, s.g, s.g), lo, hi, delta);
     }
 }
