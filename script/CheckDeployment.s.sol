@@ -8,6 +8,7 @@ import {FallpitHook} from "../src/FallpitHook.sol";
 import {FallpitRouter} from "../src/FallpitRouter.sol";
 import {IPitBook} from "../src/hook/IPitBook.sol";
 import {PitBook} from "../src/hook/PitBook.sol";
+import {PitLister} from "../src/listing/PitLister.sol";
 
 /// @notice Read-only check of a broadcast deployment, to run before anyone funds a house. The deploy's own
 ///         checks (`VaultAddressMismatch`, `HookNotWired`) run in its simulation; this reads the chain after
@@ -96,6 +97,10 @@ contract CheckDeployment is Script {
         // parameters
         IPitBook.Params memory p = book.defaultParams();
         _check(p.fillFee == vm.envOr("FILL_FEE", uint256(25e12)), "fill fee");
+        if (block.chainid == 4663) {
+            PitLister lister = PitLister(vm.parseJsonAddress(json, ".contracts.PitLister.address"));
+            _check(lister.minSeedUsd() == vm.envOr("MIN_SEED_USD", uint256(50)), "listing min seed (USD)");
+        }
 
         if (failures != 0) revert(string.concat(vm.toString(failures), " check(s) failed"));
         console.log("deployment checks passed");

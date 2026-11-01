@@ -37,6 +37,8 @@ import {LaunchRecordSource} from "../src/listing/LaunchRecordSource.sol";
 ///      HANDOVER              optional, default true. False: the deployer keeps every owner role after
 ///                            `run()`, so it can create the first houses (`createHouses()`, 24 hours
 ///                            later) with no transaction from OWNER; `handOver()` then gives them to OWNER.
+///      MIN_SEED_USD          optional, default 50. The least seed of a public listing, in whole USD
+///                            (`PitLister.setMinSeedUsd`, 50 to 5,000).
 ///      KEEPER_SIGNERS        required. Comma-separated keeper signer addresses.
 ///      KEEPER_THRESHOLD      signatures a keeper print needs (default: a strict majority).
 ///      TICKERS               comma-separated subset of the built-in table (default: all of it).
@@ -139,6 +141,8 @@ contract DeployMainnet is Script, FallpitDeployer {
             }),
             creator
         );
+        // the least listing seed, in whole USD (PitLister allows 50 to 5,000; its default is 250)
+        c.lister.setMinSeedUsd(uint32(vm.envOr("MIN_SEED_USD", uint256(50))));
 
         // tickers: the oracle's sources, then the book; the registry names each stock token's ticker
         for (uint256 i; i < rows.length; ++i) {

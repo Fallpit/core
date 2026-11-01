@@ -124,6 +124,7 @@ contract DeployMainnetForkTest is Test {
         assertEq(c.treasury.owner(), roles.owner);
         assertEq(c.registry.owner(), roles.owner);
         assertEq(c.lister.owner(), roles.owner);
+        assertEq(c.lister.minSeedUsd(), 50);
         assertEq(c.book.pendingOwner(), roles.owner);
         vm.prank(roles.owner);
         c.book.acceptOwnership();
