@@ -29,6 +29,15 @@ jobs:
       - name: Format
         run: forge fmt --check
 
+      - name: Deployment records
+        run: |
+          for f in deployments/*.json; do
+            case "$f" in *.dry-run.json) continue ;; esac
+            [ -e "$f" ] || continue
+            jq . "$f" | cmp -s - "$f" || { echo "::error file=$f::not valid JSON or not formatted as jq . writes it"; bad=1; }
+          done
+          exit "${bad:-0}"
+
       - uses: actions/cache@v4
         with:
           path: |
