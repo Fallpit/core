@@ -24,7 +24,8 @@ jobs:
 
       - uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: stable
+          # pinned: the gas snapshot below depends on the forge version
+          version: v1.8.1
 
       - name: Format
         run: forge fmt --check
@@ -51,3 +52,44 @@ jobs:
 
       - name: Test
         run: forge test
+
+      # Fuzz and invariant tests are left out: their gas changes from run to run. After a change that moves
+      # gas on purpose, regenerate with the same command without --check and commit .gas-snapshot.
+      - name: Gas snapshot
+        run: forge snapshot --no-match-test "testFuzz|invariant" --check
+
+  slither:
+    name: Slither
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Slither
+        run: pip install slither-analyzer==0.11.6
+
+      # Fails on a high-severity finding. Findings reviewed as false positives are listed, with the reason, in
+      # slither.db.json; medium findings are reported only.
+      - name: Slither
+        run: slither . --config-file slither.config.json --fail-high --sarif slither.sarif
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles('slither.sarif') != ''
+        continue-on-error: true
+        with:
+          sarif_file: slither.sarif
+          category: slither

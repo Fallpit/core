@@ -1,0 +1,62 @@
+[
+  {
+    "id": "71c9900b9be3a8a40fad7a86037127c54bd668b3e960495e8536a36793533be4",
+    "check": "arbitrary-send-erc20",
+    "impact": "High",
+    "confidence": "High",
+    "description": "SessionLogic._deposit(SessionStore,IFallpitRouter.VaultOp,address,uint128,IPitVault) (src/router/SessionLogic.sol#344-362) uses arbitrary from in transferFrom: chip.safeTransferFrom(op.user,address(this),amount) (src/router/SessionLogic.sol#357)\n",
+    "first_markdown_element": "src/router/SessionLogic.sol#L344-L362",
+    "triage": "false positive: op.user granted the session key, and the key signs each op (SessionLogic._useSession)",
+    "elements": []
+  },
+  {
+    "id": "dfbb200dc53bd10ded71aa4196bbd2fac76dec596da4b2042c1385789d382a9b",
+    "check": "arbitrary-send-erc20",
+    "impact": "High",
+    "confidence": "High",
+    "description": "SessionLogic.list(SessionStore,IFallpitRouter.ListOp,IPitLister.ListingQuote,bytes,address,bytes,address) (src/router/SessionLogic.sol#246-267) uses arbitrary from in transferFrom: chip.safeTransferFrom(op.user,address(this),seed) (src/router/SessionLogic.sol#260)\n",
+    "first_markdown_element": "src/router/SessionLogic.sol#L246-L267",
+    "triage": "false positive: op.user granted the session key, and the key signs each op (SessionLogic._useSession)",
+    "elements": []
+  },
+  {
+    "id": "03cc958b92cc826d84b0ee43f2835934a688f11f629d7cdf969e60f3c6d14234",
+    "check": "reentrancy-eth",
+    "impact": "High",
+    "confidence": "Medium",
+    "description": "Reentrancy in FallpitHook._fill(FallpitHook.Order,bytes) (src/FallpitHook.sol#451-462):\n\tExternal calls:\n\t- (o.price,o.ts,rho) = _print(r.cfg,o.t,report) (src/FallpitHook.sol#457)\n\t\t- (p,at,tl) = oracle.verifyAt{value: value}(c.ticker,t,report) (src/FallpitHook.sol#502-509)\n\t- f = _engine(r,o,lo,hi,rho) (src/FallpitHook.sol#458)\n\t\t- ! book.takeRisk(o.roundId,o.ts,f.amount,PitMath.riskBudget(r.cfg.capital,r.cfg.decimals,r.cfg.params.riskCapBps,ctx.gNew)) (src/FallpitHook.sol#533-538)\n\t\t- ! book.takeRisk(o.roundId,o.ts,uint256(delta) - f.amount,PitMath.riskBudget(r.cfg.capital,r.cfg.decimals,r.cfg.params.riskCapBps,ctx.gNew)) (src/FallpitHook.sol#533-538)\n\t\t- ! book.takeRisk(o.roundId,o.ts,0,PitMath.riskBudget(r.cfg.capital,r.cfg.decimals,r.cfg.params.riskCapBps,ctx.gNew)) (src/FallpitHook.sol#533-538)\n\tExternal calls sending eth:\n\t- (o.price,o.ts,rho) = _print(r.cfg,o.t,report) (src/FallpitHook.sol#457)\n\t\t- (p,at,tl) = oracle.verifyAt{value: value}(c.ticker,t,report) (src/FallpitHook.sol#502-509)\n\tState variables written after the call(s):\n\t- f = _engine(r,o,lo,hi,rho) (src/FallpitHook.sol#458)\n\t\t- r.st.g = uint64(ctx.gNew) (src/FallpitHook.sol#527)\n\tFallpitHook._rounds (src/FallpitHook.sol#70) can be used in cross function reentrancies:\n\t- FallpitHook.commitContext(bytes32,uint8) (src/FallpitHook.sol#324-356)\n\t- FallpitHook.decimals(uint256) (src/FallpitHook.sol#436-439)\n\t- FallpitHook.getConfig(bytes32) (src/FallpitHook.sol#379-381)\n\t- FallpitHook.getCurve(bytes32) (src/FallpitHook.sol#419-424)\n\t- FallpitHook.getState(bytes32) (src/FallpitHook.sol#384-398)\n\t- FallpitHook.getSupplies(bytes32) (src/FallpitHook.sol#401-410)\n\t- FallpitHook.seedOf(bytes32) (src/FallpitHook.sol#413-416)\n\t- FallpitHook.setSigmaEff(bytes32,uint256) (src/FallpitHook.sol#246-248)\n\t- FallpitHook.sigmaEffOf(bytes32) (src/FallpitHook.sol#251-255)\n\t- (chips,fee) = _account(r,o,f) (src/FallpitHook.sol#460)\n\t\t- r.supply[index] += uint128(o.shares) (src/FallpitHook.sol#630)\n\t\t- r.premium[index] = SafeCastLib.toUint128(r.premium[index] + chips) (src/FallpitHook.sol#631)\n\t\t- r.st.protocolFees = SafeCastLib.toUint128(protocolFees) (src/FallpitHook.sol#601)\n\t\t- r.st.held = SafeCastLib.toUint128(held) (src/FallpitHook.sol#647)\n\t\t- r.premium[index] = uint128(premium - leaving) (src/FallpitHook.sol#642)\n\t\t- r.premium[index] = uint128(0) (src/FallpitHook.sol#642)\n\tFallpitHook._rounds (src/FallpitHook.sol#70) can be used in cross function reentrancies:\n\t- FallpitHook.commitContext(bytes32,uint8) (src/FallpitHook.sol#324-356)\n\t- FallpitHook.decimals(uint256) (src/FallpitHook.sol#436-439)\n\t- FallpitHook.getConfig(bytes32) (src/FallpitHook.sol#379-381)\n\t- FallpitHook.getCurve(bytes32) (src/FallpitHook.sol#419-424)\n\t- FallpitHook.getState(bytes32) (src/FallpitHook.sol#384-398)\n\t- FallpitHook.getSupplies(bytes32) (src/FallpitHook.sol#401-410)\n\t- FallpitHook.seedOf(bytes32) (src/FallpitHook.sol#413-416)\n\t- FallpitHook.setSigmaEff(bytes32,uint256) (src/FallpitHook.sol#246-248)\n\t- FallpitHook.sigmaEffOf(bytes32) (src/FallpitHook.sol#251-255)\n",
+    "first_markdown_element": "src/FallpitHook.sol#L451-L462",
+    "triage": "false positive: the entry is guarded (nonReentrant / _entered / execute is self-only) and the oracle and book are immutable trusted contracts",
+    "elements": []
+  },
+  {
+    "id": "4b6ed7c3036d4f77e94bd40e74fad32464bbf144168ff76b22c5e3fd7a8f3ca0",
+    "check": "reentrancy-eth",
+    "impact": "High",
+    "confidence": "Medium",
+    "description": "Reentrancy in FallpitRouter._fillOne(uint256,bytes,uint256,bool) (src/FallpitRouter.sol#458-505):\n\tExternal calls:\n\t- chips = this.execute{value: value}(commitId,report) (src/FallpitRouter.sol#475-504)\n\tState variables written after the call(s):\n\t- c.status = CommitStatus.Pending (src/FallpitRouter.sol#488)\n\tFallpitRouter._commits (src/FallpitRouter.sol#136) can be used in cross function reentrancies:\n\t- FallpitRouter.execute(uint256,bytes) (src/FallpitRouter.sol#760-776)\n\t- FallpitRouter.getCommit(uint256) (src/FallpitRouter.sol#793-808)\n\t- c.status = CommitStatus.Refunded (src/FallpitRouter.sol#495)\n\tFallpitRouter._commits (src/FallpitRouter.sol#136) can be used in cross function reentrancies:\n\t- FallpitRouter.execute(uint256,bytes) (src/FallpitRouter.sol#760-776)\n\t- FallpitRouter.getCommit(uint256) (src/FallpitRouter.sol#793-808)\n",
+    "first_markdown_element": "src/FallpitRouter.sol#L458-L505",
+    "triage": "false positive: the entry is guarded (nonReentrant / _entered / execute is self-only) and the oracle and book are immutable trusted contracts",
+    "elements": []
+  },
+  {
+    "id": "c5ed016588f824c18b7e0390da394f157197f0b68059a561c3dd36741b7df737",
+    "check": "reentrancy-eth",
+    "impact": "High",
+    "confidence": "Medium",
+    "description": "Reentrancy in PitBook.recordClose(bytes32,uint32,bytes) (src/hook/PitBook.sol#223-253):\n\tExternal calls:\n\t- (price,None,trustless) = oracle.verifyCloseAt{value: msg.value}(ticker,closeAt,report) (src/hook/PitBook.sol#242)\n\tState variables written after the call(s):\n\t- _writeClose(ticker,cl,price,trustless,closeAt) (src/hook/PitBook.sol#244)\n\t\t- cl.late = true (src/hook/PitBook.sol#261)\n\t\t- cl.replaced = true (src/hook/PitBook.sol#267)\n\t\t- cl.price = uint128(price) (src/hook/PitBook.sol#269)\n\t\t- cl.trustless = trustless (src/hook/PitBook.sol#270)\n\t\t- cl.multiplier = oracle.multiplier(ticker) (src/hook/PitBook.sol#272)\n\tPitBook._closes (src/hook/PitBook.sol#132) can be used in cross function reentrancies:\n\t- PitBook._step(bytes32,IPitBook.Clock,uint32,uint32,uint256) (src/hook/PitBook.sol#631-641)\n\t- PitBook.closeInfo(bytes32,uint32) (src/hook/PitBook.sol#575-577)\n\t- PitBook.closeMultiplier(bytes32,uint32) (src/hook/PitBook.sol#559-561)\n\t- PitBook.closeOf(bytes32,uint32) (src/hook/PitBook.sol#553-556)\n\t- PitBook.closeState(bytes32,uint32) (src/hook/PitBook.sol#564-572)\n\t- PitBook.dispute(bytes32) (src/hook/PitBook.sol#302-305)\n\t- PitBook.openTerms(bytes32,uint32) (src/hook/PitBook.sol#520-535)\n\t- PitBook.recordClose(bytes32,uint32,bytes) (src/hook/PitBook.sol#223-253)\n\t- _entered = false (src/hook/PitBook.sol#249)\n\tPitBook._entered (src/hook/PitBook.sol#124) can be used in cross function reentrancies:\n\t- PitBook.recordClose(bytes32,uint32,bytes) (src/hook/PitBook.sol#223-253)\n\t- _stepOnClose(ticker,tk,last,day,fresh) (src/hook/PitBook.sol#246)\n\t\t- tk.varBefore = tk.varWad (src/hook/PitBook.sol#282)\n\t\t- tk.varWad = v (src/hook/PitBook.sol#283)\n\t\t- tk.prevCloseDay = last (src/hook/PitBook.sol#284)\n\t\t- tk.lastCloseDay = day (src/hook/PitBook.sol#285)\n\t\t- tk.lastCloseStepped = stepped (src/hook/PitBook.sol#286)\n\t\t- (tk.lastCloseStepped,tk.varWad) = _step(ticker,tk.clock,tk.prevCloseDay,day,tk.varBefore) (src/hook/PitBook.sol#288)\n\tPitBook._tickers (src/hook/PitBook.sol#130) can be used in cross function reentrancies:\n\t- PitBook.getTicker(bytes32) (src/hook/PitBook.sol#593-595)\n\t- PitBook.openTerms(bytes32,uint32) (src/hook/PitBook.sol#520-535)\n\t- PitBook.recordClose(bytes32,uint32,bytes) (src/hook/PitBook.sol#223-253)\n\t- PitBook.registerTicker(bytes32,uint256,IPitBook.Clock,IPitBook.Weights,uint8,IPitBook.FillSource) (src/hook/PitBook.sol#389-408)\n",
+    "first_markdown_element": "src/hook/PitBook.sol#L223-L253",
+    "triage": "false positive: the entry is guarded (nonReentrant / _entered / execute is self-only) and the oracle and book are immutable trusted contracts",
+    "elements": []
+  },
+  {
+    "id": "52fc0b85ac8329aeec6169768ff6c204ad0cc00c5d00b3331e7638670fda6dee",
+    "check": "uninitialized-state",
+    "impact": "High",
+    "confidence": "High",
+    "description": "PitOracle._gaps (src/PitOracle.sol#188) is never initialized. It is used in:\n\t- PitOracle.closeGap(bytes32,uint8) (src/PitOracle.sol#503-509)\n\t- PitOracle.closeGaps(bytes32,uint8) (src/PitOracle.sol#512-522)\n\t- PitOracle._addGap(bytes32,uint8,uint64,uint64) (src/PitOracle.sol#527-560)\n\t- PitOracle._inGap(bytes32,uint8,uint64) (src/PitOracle.sol#715-722)\n",
+    "first_markdown_element": "src/PitOracle.sol#L188",
+    "triage": "false positive: _gaps is written through a storage pointer in PitOracle._addGap",
+    "elements": []
+  }
+]
