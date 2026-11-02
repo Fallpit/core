@@ -44,8 +44,9 @@ jobs:
           path: |
             out
             cache
-          key: forge-${{ hashFiles('foundry.toml', 'foundry.lock', 'src/**', 'script/**', 'test/**') }}
-          restore-keys: forge-
+          # the forge version is in the key: artifacts built by another version give other gas figures
+          key: forge-v1.8.1-${{ hashFiles('foundry.toml', 'foundry.lock', 'src/**', 'script/**', 'test/**') }}
+          restore-keys: forge-v1.8.1-
 
       - name: Build and sizes
         run: forge build --sizes
