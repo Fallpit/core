@@ -87,7 +87,10 @@ contract CheckDeployment is Script {
         }
         _check(same, "oracle signers");
         _check(oracle.threshold() == vm.parseJsonUint(json, ".roles.keeperThreshold"), "oracle threshold");
-        _check(book.guardian() == vm.parseJsonAddress(json, ".roles.guardian"), "book guardian");
+        // setGuardian waits OWNER_DELAY: right after the deploy the recorded guardian is pending, not yet in force
+        address guardian = vm.parseJsonAddress(json, ".roles.guardian");
+        (address nextGuardian,) = book.pendingGuardian();
+        _check(book.guardian() == guardian || nextGuardian == guardian, "book guardian (in force or pending)");
         _check(book.feeRecipient() == vm.parseJsonAddress(json, ".roles.feeRecipient"), "book fee recipient");
         address owner = vm.parseJsonAddress(json, ".roles.owner");
         address deployer = vm.parseJsonAddress(json, ".deployer");

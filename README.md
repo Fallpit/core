@@ -10,6 +10,7 @@ house's liquidity providers take the other side, and an on-chain pricing engine 
 fill. There is no AMM pool, no order book and no stablecoin.
 
 Website: [fallpit.xyz](https://fallpit.xyz). X: [@fallpitxyz](https://x.com/fallpitxyz). Code: [github.com/Fallpit/core](https://github.com/Fallpit/core).
+Releases: [`CHANGELOG.md`](CHANGELOG.md). Mainnet addresses: [Deployed addresses](#deployed-addresses).
 
 ## How a round works
 
@@ -155,11 +156,42 @@ script. Pass `--slow --gas-estimate-multiplier 400` to every broadcast.
 
 ### Deployed addresses
 
-Once deployed, the addresses of a chain are in `deployments/<chainId>.json`.
+Every chain's record is in `deployments/<chainId>.json`: addresses, deploy block, roles, tickers and the
+launchpad sources.
+
+**Robinhood Chain mainnet (4663), Fallpit Core 0.2.0**, deployed 2026-11-02 at block 104131765. The
+source is verified on [robin.etherscan.io](https://robin.etherscan.io). The 35 tickers take effect 24 hours
+after the deploy (`inForceAt` in the record).
+
+| Contract | Address |
+|---|---|
+| LadderMath | [`0xA13a352bbD90C65a07bA1a03a28Dd3957a81dD16`](https://robin.etherscan.io/address/0xA13a352bbD90C65a07bA1a03a28Dd3957a81dD16) |
+| PitOracle | [`0x77dF165Efc8115c89E851c7FBc44D50f5A878005`](https://robin.etherscan.io/address/0x77dF165Efc8115c89E851c7FBc44D50f5A878005) |
+| ChipGuard | [`0x57C5Ce7a3617eae4963CBCF036322ebd656E5017`](https://robin.etherscan.io/address/0x57C5Ce7a3617eae4963CBCF036322ebd656E5017) |
+| PitVault | [`0xcD6dE584aBd8dBCDc3Add1647DC9B83c823f2578`](https://robin.etherscan.io/address/0xcD6dE584aBd8dBCDc3Add1647DC9B83c823f2578) |
+| PitBook | [`0x7647ed486D5CaAdb43BBd4BEc61ef4D5A54879bA`](https://robin.etherscan.io/address/0x7647ed486D5CaAdb43BBd4BEc61ef4D5A54879bA) |
+| FallpitRouter | [`0xe306253438ac6f787e4924aCfDc481CC7096B8a6`](https://robin.etherscan.io/address/0xe306253438ac6f787e4924aCfDc481CC7096B8a6) |
+| FallpitHook | [`0x2a70EE5fC2A3D1FAfFA629a97BDAC0B512158a5a`](https://robin.etherscan.io/address/0x2a70EE5fC2A3D1FAfFA629a97BDAC0B512158a5a) |
+| FallpitLens | [`0x4AE79551a9A203288481C2ae78B3da67E4E34b3D`](https://robin.etherscan.io/address/0x4AE79551a9A203288481C2ae78B3da67E4E34b3D) |
+| FallpitDirectory | [`0x0F7d39CAc4f646e9d717326737E0E32bc918F322`](https://robin.etherscan.io/address/0x0F7d39CAc4f646e9d717326737E0E32bc918F322) |
+| CommunityTreasury | [`0x2eA3D2Da5eEEb5AD9caC3821C6A5C0E7d8FA7412`](https://robin.etherscan.io/address/0x2eA3D2Da5eEEb5AD9caC3821C6A5C0E7d8FA7412) |
+| AnchorRegistry | [`0x881C78A52a813b9b711514E9f0518D2faCB01F84`](https://robin.etherscan.io/address/0x881C78A52a813b9b711514E9f0518D2faCB01F84) |
+| PitLister | [`0x3DaD9295176650946C65e0d88e6b0185a8133995`](https://robin.etherscan.io/address/0x3DaD9295176650946C65e0d88e6b0185a8133995) |
+| VaultFeeForwarderFactory | [`0xDd3D831cF1C60aE08a9EBA9F7B9EFB734A2eF226`](https://robin.etherscan.io/address/0xDd3D831cF1C60aE08a9EBA9F7B9EFB734A2eF226) |
+| RoundLogic (library) | [`0x7e0CfEdFEEEB0464B35B1774aC6fd600234524b9`](https://robin.etherscan.io/address/0x7e0CfEdFEEEB0464B35B1774aC6fd600234524b9) |
+| PitBookRules (library) | [`0x04DE7daCB4A4D9Aac7b92517d8Cc68D0BEa38a5c`](https://robin.etherscan.io/address/0x04DE7daCB4A4D9Aac7b92517d8Cc68D0BEa38a5c) |
+| PitBookLogic (library) | [`0xF8f561Be7c36141bD5409112371cFf2904078363`](https://robin.etherscan.io/address/0xF8f561Be7c36141bD5409112371cFf2904078363) |
+| SessionLogic (library) | [`0xe46a950989CdD42B816651443f6eaefab31E6a3d`](https://robin.etherscan.io/address/0xe46a950989CdD42B816651443f6eaefab31E6a3d) |
+
+Roles: owner, guardian and fee recipient `0xE80bbcAB9E20fc193Ef768B68d69F363a7f9a2a1`. Price signers (2 of 3):
+`0x15D92cf81334Be7eEB54f12e7181e58d849Cdec6`, `0x47F3aA398FAB9eb8Da31C5e376A8a55107562E23`, `0x9D37eC937AD7bFC42AC1D9680bE3C91E5197d469`. External: Uniswap v4 `PoolManager`
+`0x8366a39CC670B4001A1121B8F6A443A643e40951`.
+
+Check a deployment read-only with `forge script script/CheckDeployment.s.sol --rpc-url <RPC>`.
 
 ## Security
 
-The contracts have not had a third-party audit. Report a vulnerability privately to hi@fallpit.xyz. Do not
+See [`SECURITY.md`](SECURITY.md). The contracts have not had a third-party audit. Report a vulnerability privately to hi@fallpit.xyz. Do not
 open a public issue for it.
 
 ## License

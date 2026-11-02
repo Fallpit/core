@@ -737,7 +737,7 @@ contract DeployMainnet is Script, FallpitDeployer {
             withPyth
                 ? bytes32(0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace)
                 : bytes32(0),
-            350,
+            275, // 2.75% a day: realized ETH vol, 150 days to 2026-11-01 (review 2026-11-01-algo-scenarios)
             IPitBook.Clock.EveryDay,
             IPitBook.FillSource.KeeperOnly
         );
